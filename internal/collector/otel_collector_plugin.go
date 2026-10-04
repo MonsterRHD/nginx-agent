@@ -14,6 +14,7 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"sync"
@@ -36,6 +37,7 @@ const (
 	maxTimeToWaitForShutdown  = 30 * time.Second
 	defaultCollectionInterval = 1 * time.Minute
 	filePermission            = 0o600
+	startupPollInterval       = 10 * time.Millisecond
 	// To conform to the rfc3164 spec the timestamp in the logs need to be formatted correctly.
 	// RFC 3164 timestamps carry no timezone and the syslog parser interprets them as UTC,
 	// so the timestamp is always converted to UTC before it is formatted.
@@ -53,24 +55,32 @@ const (
 	insertAction        = "insert"
 )
 
+var (
+	_                            bus.Plugin = (*Collector)(nil)
+	initMutex                               = &sync.Mutex{}
+	errNoReceiversConfigured                = errors.New("no receivers configured: waiting for receiver discovery")
+	errCollectorShutdownTimedOut            = errors.New("timed out waiting for OTel collector to close")
+)
+
 type (
 	// Collector The OTel collector plugin start an embedded OTel collector for metrics collection in the OTel format.
 	Collector struct {
 		service                 types.CollectorInterface
 		config                  *config.Config
-		mu                      *sync.Mutex
 		cancel                  context.CancelFunc
 		previousNAPSysLogServer string
 		debugOTelConfigPath     string
-		stopped                 bool
-		agentConfigMutex        sync.Mutex
-		restartMutex            sync.Mutex
+		// switchMu serializes every configuration transaction (resource
+		// updates, NGINX config updates and management plane header updates)
+		// so that concurrent updates converge, in order, onto the latest
+		// complete candidate and a switch can never interleave with another.
+		switchMu sync.Mutex
+		// stopped reports whether the last confirmed pipeline is running.
+		stopped bool
+		// closed is set by Close so that updates queued during shutdown are
+		// discarded instead of starting a new pipeline.
+		closed bool
 	}
-)
-
-var (
-	_         bus.Plugin = (*Collector)(nil)
-	initMutex            = &sync.Mutex{}
 )
 
 // NewCollector is the constructor for the Collector plugin.
@@ -93,6 +103,10 @@ func NewCollector(conf *config.Config) (*Collector, error) {
 		}
 	}
 
+	// An agent restart only reads the last confirmed config: remove a config
+	// staging file that may have been left behind by an aborted switch.
+	cleanupStaleTempConfig(conf.Collector.ConfigPath)
+
 	settings := OTelCollectorSettings(conf)
 	oTelCollector, err := otelcol.NewCollector(settings)
 	if err != nil {
@@ -105,26 +119,32 @@ func NewCollector(conf *config.Config) (*Collector, error) {
 		config:                  conf,
 		service:                 oTelCollector,
 		stopped:                 true,
-		mu:                      &sync.Mutex{},
-		agentConfigMutex:        sync.Mutex{},
 		previousNAPSysLogServer: "",
 		debugOTelConfigPath:     debugOTelConfigPath,
 	}, nil
 }
 
 func (oc *Collector) State() otelcol.State {
-	oc.mu.Lock()
-	defer oc.mu.Unlock()
+	oc.switchMu.Lock()
+	defer oc.switchMu.Unlock()
+
+	if oc.service == nil {
+		return otelcol.StateClosed
+	}
 
 	return oc.service.GetState()
 }
 
 // Init initializes and starts the plugin
-func (oc *Collector) Init(ctx context.Context, mp bus.MessagePipeInterface) error {
+func (oc *Collector) Init(ctx context.Context, _ bus.MessagePipeInterface) error {
 	slog.InfoContext(ctx, "Starting OTel Collector plugin")
 
-	var runCtx context.Context
-	runCtx, oc.cancel = context.WithCancel(ctx)
+	runCtx, cancel := context.WithCancel(ctx)
+
+	oc.switchMu.Lock()
+	defer oc.switchMu.Unlock()
+
+	oc.cancel = cancel
 
 	if !oc.config.AreReceiversConfigured() {
 		slog.InfoContext(runCtx, "No receivers configured for OTel Collector. "+
@@ -133,22 +153,17 @@ func (oc *Collector) Init(ctx context.Context, mp bus.MessagePipeInterface) erro
 		return nil
 	}
 
-	err := writeCollectorConfig(oc.config.Collector)
-	if err != nil {
-		return fmt.Errorf("write OTel Collector config: %w", err)
-	}
-
 	if oc.config.Collector.Receivers.OtlpReceivers != nil {
-		oc.processReceivers(ctx, oc.config.Collector.Receivers.OtlpReceivers)
+		oc.processReceivers(runCtx, oc.config.Collector.Receivers.OtlpReceivers)
 	}
 
 	if !oc.stopped {
 		return errors.New("OTel collector already running")
 	}
 
-	bootErr := oc.bootup(runCtx)
-	if bootErr != nil {
-		slog.ErrorContext(runCtx, "Unable to start OTel Collector", "error", bootErr)
+	if err := oc.applyCandidate(runCtx, oc.config); err != nil {
+		slog.ErrorContext(runCtx, "Unable to start OTel Collector", "error", err)
+		return fmt.Errorf("start OTel Collector: %w", err)
 	}
 
 	return nil
@@ -164,6 +179,11 @@ func (oc *Collector) Info() *bus.Info {
 // Close the plugin.
 func (oc *Collector) Close(ctx context.Context) error {
 	slog.InfoContext(ctx, "Closing OTel Collector plugin")
+
+	oc.switchMu.Lock()
+	defer oc.switchMu.Unlock()
+
+	oc.closed = true
 
 	return oc.shutdownCollector(ctx)
 }
@@ -188,56 +208,222 @@ func (oc *Collector) Subscriptions() []string {
 	}
 }
 
+// Reconfigure handles an agent config update coming from the management plane.
+// Only collector header changes require a collector restart; the restart uses
+// the same validated, reversible switch as runtime updates so that a failed
+// restart never replaces or corrupts the last healthy pipeline.
 func (oc *Collector) Reconfigure(ctx context.Context, agentConfig *config.Config) error {
 	slog.DebugContext(ctx, "OTel collector plugin received agent config update message")
 
-	oc.agentConfigMutex.Lock()
-	defer oc.agentConfigMutex.Unlock()
+	if agentConfig == nil || agentConfig.Collector == nil {
+		return nil
+	}
 
-	if oc.config.Collector != nil && oc.config.Collector.Extensions.HeadersSetter != nil &&
-		oc.config.Collector.Extensions.HeadersSetter.Headers != nil {
-		if !reflect.DeepEqual(oc.config.Collector.Extensions.HeadersSetter.Headers,
-			agentConfig.Collector.Extensions.HeadersSetter.Headers) {
-			slog.InfoContext(ctx, "OTel collector headers have changed, restarting collector")
-			oc.config = agentConfig
-			oc.restartMutex.Lock()
-			defer oc.restartMutex.Unlock()
-			oc.restartCollector(ctx)
+	oc.switchMu.Lock()
+	defer oc.switchMu.Unlock()
+
+	if oc.closed {
+		return nil
+	}
+
+	if !collectorHeadersChanged(oc.config, agentConfig) {
+		return nil
+	}
+
+	candidate := deepCopyConfig(agentConfig)
+	oc.preserveRuntimeState(candidate)
+
+	if !candidate.AreReceiversConfigured() {
+		slog.InfoContext(ctx, "OTel collector headers changed but no receivers are configured; "+
+			"waiting to discover a receiver before restarting")
+
+		return nil
+	}
+
+	slog.InfoContext(ctx, "OTel collector headers have changed, restarting collector")
+	if err := oc.applyCandidate(ctx, candidate); err != nil {
+		if errors.Is(err, errNoReceiversConfigured) {
+			return nil
 		}
-	} else {
-		slog.InfoContext(ctx, "OTel collector headers have been added, restarting collector")
-		oc.config = agentConfig
-		oc.restartMutex.Lock()
-		defer oc.restartMutex.Unlock()
-		oc.restartCollector(ctx)
+
+		slog.ErrorContext(ctx, "Failed to restart OTel collector with updated headers; "+
+			"keeping last healthy config", "error", err)
 	}
 
 	return nil
 }
 
+// collectorHeadersChanged reports whether the headers_setter headers differ
+// between two agent configs, treating missing extensions as nil headers.
+func collectorHeadersChanged(current, updated *config.Config) bool {
+	var currentHeaders, updatedHeaders []config.Header
+
+	if current != nil && current.Collector != nil &&
+		current.Collector.Extensions.HeadersSetter != nil {
+		currentHeaders = current.Collector.Extensions.HeadersSetter.Headers
+	}
+
+	if updated != nil && updated.Collector != nil &&
+		updated.Collector.Extensions.HeadersSetter != nil {
+		updatedHeaders = updated.Collector.Extensions.HeadersSetter.Headers
+	}
+
+	return !reflect.DeepEqual(currentHeaders, updatedHeaders)
+}
+
+// preserveRuntimeState carries state that only exists at runtime (discovered
+// receivers, resource attributes and the uuid header) from the last confirmed
+// config into a management plane candidate, which would otherwise only
+// contain statically configured components.
+func (oc *Collector) preserveRuntimeState(candidate *config.Config) {
+	if oc.config == nil || oc.config.Collector == nil || candidate.Collector == nil {
+		return
+	}
+
+	lastCollectors := oc.config.Collector.Receivers
+	candidateReceivers := &candidate.Collector.Receivers
+
+	candidateReceivers.NginxReceivers = copyOf(lastCollectors.NginxReceivers)
+	candidateReceivers.NginxPlusReceivers = copyOf(lastCollectors.NginxPlusReceivers)
+	candidateReceivers.CertificateReceivers = copyOf(lastCollectors.CertificateReceivers)
+
+	if napReceiver, ok := lastCollectors.TcplogReceivers["nginx_app_protect"]; ok && napReceiver != nil {
+		if candidateReceivers.TcplogReceivers == nil {
+			candidateReceivers.TcplogReceivers = make(map[string]*config.TcplogReceiver)
+		}
+
+		candidateReceivers.TcplogReceivers["nginx_app_protect"] = copyOf(napReceiver)
+	}
+
+	oc.preserveRuntimeResourceAttributes(candidate)
+	oc.preserveUUIDHeader(candidate)
+}
+
+func (oc *Collector) preserveRuntimeResourceAttributes(candidate *config.Config) {
+	lastResourceProcessors := oc.config.Collector.Processors.Resource
+	lastDefault, ok := lastResourceProcessors["default"]
+	if !ok || lastDefault == nil {
+		return
+	}
+
+	if candidate.Collector.Processors.Resource == nil {
+		candidate.Collector.Processors.Resource = make(map[string]*config.Resource)
+	}
+
+	candidateDefault, exists := candidate.Collector.Processors.Resource["default"]
+	if !exists || candidateDefault == nil {
+		candidate.Collector.Processors.Resource["default"] = copyOf(lastDefault)
+		return
+	}
+
+	for _, attribute := range lastDefault.Attributes {
+		if !containsResourceAttribute(candidateDefault.Attributes, attribute.Key) {
+			candidateDefault.Attributes = append(candidateDefault.Attributes, copyOf(attribute))
+		}
+	}
+}
+
+func (oc *Collector) preserveUUIDHeader(candidate *config.Config) {
+	if oc.config.Collector.Extensions.HeadersSetter == nil {
+		return
+	}
+
+	uuidHeader := findHeader(oc.config.Collector.Extensions.HeadersSetter.Headers, "uuid")
+	if uuidHeader == nil {
+		return
+	}
+
+	if candidate.Collector.Extensions.HeadersSetter == nil {
+		candidate.Collector.Extensions.HeadersSetter = &config.HeadersSetter{}
+	}
+
+	if !containsHeader(candidate.Collector.Extensions.HeadersSetter.Headers, "uuid") {
+		candidate.Collector.Extensions.HeadersSetter.Headers = append(
+			candidate.Collector.Extensions.HeadersSetter.Headers,
+			copyOf(*uuidHeader),
+		)
+	}
+}
+
+func containsResourceAttribute(attributes []config.ResourceAttribute, key string) bool {
+	for _, attribute := range attributes {
+		if attribute.Key == key {
+			return true
+		}
+	}
+
+	return false
+}
+
+func findHeader(headers []config.Header, key string) *config.Header {
+	for i := range headers {
+		if headers[i].Key == key {
+			return &headers[i]
+		}
+	}
+
+	return nil
+}
+
+func containsHeader(headers []config.Header, key string) bool {
+	return findHeader(headers, key) != nil
+}
+
+// shutdownCollector stops the currently running collector. The caller must
+// hold switchMu. Errors are logged but not returned so that plugin shutdown
+// cannot be blocked; the state flag is only flipped once the collector is
+// closed.
 func (oc *Collector) shutdownCollector(ctx context.Context) error {
-	if !oc.stopped {
-		slog.InfoContext(ctx, "Shutting down OTel Collector", "state", oc.service.GetState())
-		oc.service.Shutdown()
-		oc.cancel()
-
-		settings := *oc.config.Client.Backoff
-		settings.MaxElapsedTime = maxTimeToWaitForShutdown
-		err := backoff.WaitUntil(ctx, &settings, func() error {
-			if oc.service.GetState() == otelcol.StateClosed {
-				return nil
-			}
-
-			return errors.New("OTel Collector not in a closed state yet")
-		})
-
-		if err != nil {
-			slog.ErrorContext(ctx, "Failed to shutdown OTel Collector", "error", err, "state", oc.service.GetState())
+	if !oc.stopped && oc.service != nil {
+		if err := oc.stopService(ctx, oc.service, oc.cancel); err != nil {
+			slog.ErrorContext(ctx, "Failed to shutdown OTel Collector", "error", err)
 		} else {
-			slog.InfoContext(ctx, "OTel Collector shutdown", "state", oc.service.GetState())
 			oc.stopped = true
 		}
 	}
+
+	return nil
+}
+
+// stopService asks a running collector to shut down and waits for it to reach
+// the closed state. Shutdown is executed in a goroutine so that a stuck
+// shutdown cannot block forever; the run context is canceled as well.
+func (oc *Collector) stopService(
+	ctx context.Context,
+	svc types.CollectorInterface,
+	cancel context.CancelFunc,
+) error {
+	if svc == nil {
+		return nil
+	}
+
+	slog.InfoContext(ctx, "Shutting down OTel Collector", "state", svc.GetState())
+
+	go func() {
+		svc.Shutdown()
+	}()
+
+	if cancel != nil {
+		cancel()
+	}
+
+	settings := *oc.config.Client.Backoff
+	if settings.MaxElapsedTime <= 0 || settings.MaxElapsedTime > maxTimeToWaitForShutdown {
+		settings.MaxElapsedTime = maxTimeToWaitForShutdown
+	}
+	waitErr := backoff.WaitUntil(ctx, &settings, func() error {
+		if svc.GetState() == otelcol.StateClosed {
+			return nil
+		}
+
+		return errors.New("OTel Collector not in a closed state yet")
+	})
+	if waitErr != nil {
+		slog.ErrorContext(ctx, "Failed to shutdown OTel Collector", "error", waitErr, "state", svc.GetState())
+		return errCollectorShutdownTimedOut
+	}
+
+	slog.InfoContext(ctx, "OTel Collector shutdown", "state", svc.GetState())
 
 	return nil
 }
@@ -267,59 +453,91 @@ func (oc *Collector) processReceivers(ctx context.Context, receivers map[string]
 	}
 }
 
-//nolint:revive,cyclop // cognitive complexity is 13
-func (oc *Collector) bootup(ctx context.Context) error {
-	errChan := make(chan error)
+// bootup starts the provided collector and returns only once it is running.
+// It never mutates Collector state: the caller is responsible for committing
+// the service once boot succeeds, or for rolling it back on error.
+func (oc *Collector) bootup(ctx context.Context, service types.CollectorInterface, conf *config.Config) error {
+	if service == nil {
+		return errors.New("unable to start OTel collector: service is nil")
+	}
+
+	errChan := make(chan error, 1)
 
 	go func() {
-		if oc.service == nil {
-			errChan <- errors.New("unable to start OTel collector: service is nil")
-			return
-		}
-
-		if oc.config.IsCommandServerProxyConfigured() {
-			oc.setProxyIfNeeded(ctx)
+		if conf.IsCommandServerProxyConfigured() {
+			oc.setProxyIfNeeded(ctx, conf)
 		}
 
 		slog.InfoContext(ctx, "Starting OTel collector")
-		appErr := oc.service.Run(ctx)
-		if appErr != nil {
-			errChan <- appErr
+		if err := service.Run(ctx); err != nil {
+			errChan <- err
 		}
 		slog.InfoContext(ctx, "OTel collector has stopped running")
 	}()
+
+	ticker := time.NewTicker(startupPollInterval)
+	defer ticker.Stop()
 
 	for {
 		select {
 		case err := <-errChan:
 			return err
-		default:
-			if oc.service == nil {
-				return errors.New("unable to start otel collector: service is nil")
-			}
-
-			state := oc.service.GetState()
-			switch state {
-			case otelcol.StateStarting:
-				// NoOp
-				continue
-			case otelcol.StateRunning:
-				oc.stopped = false
-				return nil
-			case otelcol.StateClosing:
-			case otelcol.StateClosed:
-				oc.stopped = true
-			default:
-				return fmt.Errorf("unable to start, otelcol state is %s", state)
-			}
+		case <-ticker.C:
 		}
+
+		state := service.GetState()
+		switch state {
+		case otelcol.StateStarting, otelcol.StateClosing:
+			continue
+		case otelcol.StateRunning:
+			return nil
+		case otelcol.StateClosed:
+			return errors.New("OTel collector entered closed state while starting")
+		default:
+			return fmt.Errorf("unable to start, otelcol state is %s", state)
+		}
+	}
+}
+
+// applyUpdate serializes a runtime configuration event onto the switch lock.
+// The event is applied to an independent candidate copy; the last confirmed
+// config and running pipeline are only replaced after the candidate has been
+// validated and switched over successfully.
+func (oc *Collector) applyUpdate(ctx context.Context, reason string, mutate func(candidate *config.Config) bool) {
+	oc.switchMu.Lock()
+	defer oc.switchMu.Unlock()
+
+	if oc.closed {
+		slog.DebugContext(ctx, "Ignoring OTel collector config update, plugin is closed")
+		return
+	}
+
+	previousNAPServer := oc.previousNAPSysLogServer
+	candidate := deepCopyConfig(oc.config)
+
+	if !mutate(candidate) {
+		return
+	}
+
+	if err := oc.applyCandidate(ctx, candidate); err != nil {
+		// The NAP syslog probe cache belongs to committed runtime state; a
+		// rejected candidate must not move it forward.
+		oc.previousNAPSysLogServer = previousNAPServer
+
+		if errors.Is(err, errNoReceiversConfigured) {
+			slog.InfoContext(ctx, "Candidate OTel config has no receivers; keeping the last healthy "+
+				"pipeline and waiting for receiver discovery", "reason", reason)
+
+			return
+		}
+
+		slog.ErrorContext(ctx, "Failed to switch OTel collector config; keeping the last healthy config",
+			"reason", reason, "error", err)
 	}
 }
 
 func (oc *Collector) handleNginxConfigUpdate(ctx context.Context, msg *bus.Message) {
 	slog.DebugContext(ctx, "OTel collector plugin received nginx config update message")
-	oc.mu.Lock()
-	defer oc.mu.Unlock()
 
 	nginxConfigContext, ok := msg.Data.(*model.NginxConfigContext)
 	if !ok {
@@ -327,26 +545,13 @@ func (oc *Collector) handleNginxConfigUpdate(ctx context.Context, msg *bus.Messa
 		return
 	}
 
-	reloadCollector := oc.checkForNewReceivers(ctx, nginxConfigContext)
-
-	if reloadCollector {
-		slog.InfoContext(ctx, "Reloading OTel collector config, nginx config updated")
-		err := writeCollectorConfig(oc.config.Collector)
-		if err != nil {
-			slog.ErrorContext(ctx, "Failed to write OTel Collector config", "error", err)
-			return
-		}
-
-		oc.restartMutex.Lock()
-		defer oc.restartMutex.Unlock()
-		oc.restartCollector(ctx)
-	}
+	oc.applyUpdate(ctx, "nginx config updated", func(candidate *config.Config) bool {
+		return oc.checkForNewReceivers(ctx, candidate, nginxConfigContext)
+	})
 }
 
 func (oc *Collector) handleResourceUpdate(ctx context.Context, msg *bus.Message) {
 	slog.DebugContext(ctx, "OTel collector plugin received resource update message")
-	oc.mu.Lock()
-	defer oc.mu.Unlock()
 
 	resourceUpdateContext, ok := msg.Data.(*v1.Resource)
 	if !ok {
@@ -354,36 +559,307 @@ func (oc *Collector) handleResourceUpdate(ctx context.Context, msg *bus.Message)
 		return
 	}
 
-	resourceProcessorUpdated := oc.updateResourceProcessor(resourceUpdateContext)
-	headersSetterExtensionUpdated := oc.updateHeadersSetterExtension(ctx, resourceUpdateContext)
+	oc.applyUpdate(ctx, "resource updated", func(candidate *config.Config) bool {
+		// Call both updaters unconditionally so a resource id update does not
+		// short-circuit the uuid header update.
+		resourceProcessorUpdated := oc.updateResourceProcessor(candidate, resourceUpdateContext)
+		headersSetterExtensionUpdated := oc.updateHeadersSetterExtension(ctx, candidate, resourceUpdateContext)
 
-	if resourceProcessorUpdated || headersSetterExtensionUpdated {
-		slog.InfoContext(ctx, "Reloading OTel collector config, resource updated")
-		err := writeCollectorConfig(oc.config.Collector)
-		if err != nil {
-			slog.ErrorContext(ctx, "Failed to write OTel Collector config", "error", err)
-			return
+		return resourceProcessorUpdated || headersSetterExtensionUpdated
+	})
+}
+
+// applyCandidate performs the validated, reversible configuration switch. The
+// caller must hold switchMu. The candidate is rendered, parsed and validated
+// first; the last healthy collector keeps running until the candidate is
+// ready. If stopping the old collector or starting the new one fails, the last
+// healthy config is restored on disk and a fresh collector running that config
+// is started, so in-memory config, disk config, receiver set and runtime state
+// only ever reflect a single confirmed version.
+func (oc *Collector) applyCandidate(ctx context.Context, candidate *config.Config) error {
+	if candidate == nil || candidate.Collector == nil {
+		return errors.New("nil OTel collector candidate config")
+	}
+
+	if !candidate.AreReceiversConfigured() {
+		return errNoReceiversConfigured
+	}
+
+	confPath := filepath.Clean(candidate.Collector.ConfigPath)
+
+	// Stage 1: render the candidate and stage it next to the confirmed config.
+	tempPath, err := stageCollectorConfig(candidate.Collector)
+	if err != nil {
+		return fmt.Errorf("render OTel collector config candidate: %w", err)
+	}
+
+	// Stage 2: parse and validate the staged candidate. The running pipeline
+	// is not touched at all at this point.
+	if validationErr := oc.validateCandidate(ctx, candidate, tempPath); validationErr != nil {
+		_ = os.Remove(tempPath)
+		return validationErr
+	}
+
+	// Snapshot everything required to roll back to the last healthy version.
+	rollback := oc.newRollbackState(ctx, confPath)
+
+	// Stages 3 and 4: retire the running collector and atomically publish the
+	// new config, restoring the last healthy pipeline on any failure.
+	if switchErr := oc.retireAndPublish(ctx, tempPath, rollback); switchErr != nil {
+		return switchErr
+	}
+
+	// Stage 5: build and start the new collector.
+	newService, cancel, startErr := oc.startCollector(ctx, candidate)
+	if startErr != nil {
+		restoreErr := oc.rollbackAfterFailedStart(ctx, rollback)
+
+		return fmt.Errorf("%w (restore error: %v)", startErr, restoreErr)
+	}
+
+	// Stage 6: commit the new version. Only after a successful switch do the
+	// in-memory config, disk config, receiver set and runtime state reflect
+	// the candidate.
+	oc.config = candidate
+	oc.service = newService
+	oc.cancel = cancel
+	oc.stopped = false
+
+	return nil
+}
+
+// rollbackState captures the last confirmed version that a failed switch can
+// be reverted to: its in-memory config, the running collector instance, the
+// bytes currently published on disk and whether a config file existed at all.
+type rollbackState struct {
+	config      *config.Config
+	service     types.CollectorInterface
+	cancel      context.CancelFunc
+	confPath    string
+	configData  []byte
+	diskExisted bool
+	wasRunning  bool
+}
+
+// newRollbackState snapshots the current confirmed state and renders the last
+// healthy config to bytes so that it can be republished during a rollback.
+func (oc *Collector) newRollbackState(ctx context.Context, confPath string) *rollbackState {
+	_, diskStatErr := os.Stat(confPath)
+	state := &rollbackState{
+		config:      oc.config,
+		service:     oc.service,
+		cancel:      oc.cancel,
+		confPath:    confPath,
+		diskExisted: diskStatErr == nil,
+		wasRunning:  !oc.stopped && oc.service != nil,
+	}
+	state.configData = state.renderConfig(ctx)
+
+	return state
+}
+
+// renderConfig renders the last healthy config to bytes from an independent
+// copy so that rollback rendering never mutates the confirmed in-memory
+// config.
+func (r *rollbackState) renderConfig(ctx context.Context) []byte {
+	if !r.diskExisted || r.config == nil {
+		return nil
+	}
+
+	rollbackCopy := deepCopyConfig(r.config)
+	data, err := renderCollectorConfig(rollbackCopy.Collector)
+	if err != nil {
+		slog.ErrorContext(ctx, "Failed to render last healthy OTel collector config for rollback",
+			"error", err)
+
+		return nil
+	}
+
+	return data
+}
+
+// retireAndPublish stops the currently running collector (if any) and
+// atomically publishes the staged candidate over the confirmed config path.
+// Any failure restores the last healthy pipeline and returns an error; the
+// in-memory config is left untouched by this method.
+func (oc *Collector) retireAndPublish(ctx context.Context, tempPath string, rollback *rollbackState) error {
+	if rollback.wasRunning {
+		if shutdownErr := oc.stopService(ctx, rollback.service, rollback.cancel); shutdownErr != nil {
+			_ = os.Remove(tempPath)
+			restoreErr := oc.restoreLastHealthy(ctx, rollback)
+
+			return fmt.Errorf("shutdown retiring OTel collector: %w (restore error: %v)",
+				shutdownErr, restoreErr)
 		}
 
-		oc.restartMutex.Lock()
-		defer oc.restartMutex.Unlock()
-		oc.restartCollector(ctx)
+		oc.stopped = true
+	}
+
+	if publishErr := publishConfig(tempPath, rollback.confPath); publishErr != nil {
+		_ = os.Remove(tempPath)
+		var restoreErr error
+		if rollback.wasRunning {
+			restoreErr = oc.restoreLastHealthy(ctx, rollback)
+		}
+
+		return fmt.Errorf("publish OTel collector config: %w (restore error: %v)",
+			publishErr, restoreErr)
+	}
+
+	return nil
+}
+
+// startCollector builds a collector for the candidate and brings it up to the
+// running state without touching any Collector field: the caller commits the
+// returned service only after a successful switch.
+//
+//nolint:ireturn // returns the concrete collector abstraction used by the plugin
+func (oc *Collector) startCollector(
+	ctx context.Context,
+	candidate *config.Config,
+) (types.CollectorInterface, context.CancelFunc, error) {
+	settings := OTelCollectorSettings(candidate)
+	oc.writeDebugConfigIfEnabled(ctx, candidate, settings)
+
+	newService, err := otelcol.NewCollector(settings)
+	if err != nil {
+		return nil, nil, fmt.Errorf("create new OTel collector: %w", err)
+	}
+
+	runCtx, cancel := context.WithCancel(ctx)
+	if bootErr := oc.bootup(runCtx, newService, candidate); bootErr != nil {
+		cancel()
+
+		return nil, nil, fmt.Errorf("start new OTel collector: %w", bootErr)
+	}
+
+	return newService, cancel, nil
+}
+
+// validateCandidate parses the staged config with the same factories and URI
+// merge order as the running collector and performs a dry-run validation of
+// the full component graph, without starting the collector or binding ports.
+func (oc *Collector) validateCandidate(ctx context.Context, candidate *config.Config, tempPath string) error {
+	settings := OTelCollectorSettings(candidate)
+	settings.ConfigProviderSettings.ResolverSettings.URIs = configURIs(
+		tempPath, candidate.Collector.AdditionalConfigPaths,
+	)
+
+	validator, err := otelcol.NewCollector(settings)
+	if err != nil {
+		return fmt.Errorf("build OTel collector config validator: %w", err)
+	}
+
+	if dryRunErr := validator.DryRun(ctx); dryRunErr != nil {
+		return fmt.Errorf("invalid OTel collector config candidate: %w", dryRunErr)
+	}
+
+	return nil
+}
+
+func (oc *Collector) writeDebugConfigIfEnabled(
+	ctx context.Context,
+	candidate *config.Config,
+	settings otelcol.CollectorSettings,
+) {
+	if candidate.Log == nil || strings.ToLower(candidate.Log.Level) != "debug" {
+		return
+	}
+
+	if err := oc.writeRunningConfig(ctx, settings); err != nil {
+		slog.ErrorContext(ctx, "Failed to write debug OTel Collector config", "error", err)
 	}
 }
 
-func (oc *Collector) updateResourceProcessor(resourceUpdateContext *v1.Resource) bool {
+// rollbackAfterFailedStart restores the last healthy disk config and, if a
+// pipeline was running before the switch, restarts the last healthy collector.
+func (oc *Collector) rollbackAfterFailedStart(ctx context.Context, rollback *rollbackState) error {
+	rollback.republish(ctx)
+
+	if !rollback.wasRunning {
+		oc.stopped = true
+
+		return nil
+	}
+
+	return oc.restoreLastHealthy(ctx, rollback)
+}
+
+// restoreLastHealthy re-publishes the last healthy config and starts a fresh
+// collector with it, re-providing the collection that was live before the
+// failed switch. It must not be called with a nil lastGood config.
+func (oc *Collector) restoreLastHealthy(ctx context.Context, rollback *rollbackState) error {
+	if rollback.config == nil {
+		return errors.New("no last healthy OTel collector config to restore")
+	}
+
+	rollback.republish(ctx)
+
+	slog.InfoContext(ctx, "Restoring last healthy OTel collector configuration")
+
+	service, err := otelcol.NewCollector(OTelCollectorSettings(rollback.config))
+	if err != nil {
+		return fmt.Errorf("recreate last healthy OTel collector: %w", err)
+	}
+
+	runCtx, cancel := context.WithCancel(ctx)
+	if bootErr := oc.bootup(runCtx, service, rollback.config); bootErr != nil {
+		cancel()
+
+		return fmt.Errorf("restart last healthy OTel collector: %w", bootErr)
+	}
+
+	oc.service = service
+	oc.cancel = cancel
+	oc.stopped = false
+
+	return nil
+}
+
+// republish puts the last confirmed config bytes back on disk atomically, or
+// removes the config file if no confirmed config existed before the switch.
+func (r *rollbackState) republish(ctx context.Context) {
+	if !r.diskExisted {
+		if err := os.Remove(r.confPath); err != nil && !os.IsNotExist(err) {
+			slog.ErrorContext(ctx,
+				"Failed to remove unconfirmed OTel collector config during rollback",
+				"config_path", r.confPath, "error", err)
+		}
+
+		return
+	}
+
+	tempPath := tempConfigPath(r.confPath)
+	if err := writeConfigFile(tempPath, r.configData); err != nil {
+		slog.ErrorContext(ctx,
+			"Failed to stage last healthy OTel collector config during rollback",
+			"config_path", r.confPath, "error", err)
+
+		return
+	}
+
+	if err := publishConfig(tempPath, r.confPath); err != nil {
+		_ = os.Remove(tempPath)
+		slog.ErrorContext(ctx,
+			"Failed to republish last healthy OTel collector config",
+			"config_path", r.confPath, "error", err)
+	}
+}
+
+func (oc *Collector) updateResourceProcessor(cfg *config.Config, resourceUpdateContext *v1.Resource) bool {
 	resourceProcessorUpdated := false
 
-	if oc.config.Collector.Processors.Resource == nil {
-		oc.config.Collector.Processors.Resource = make(map[string]*config.Resource)
-		oc.config.Collector.Processors.Resource["default"] = &config.Resource{
+	if cfg.Collector.Processors.Resource == nil {
+		cfg.Collector.Processors.Resource = make(map[string]*config.Resource)
+		cfg.Collector.Processors.Resource["default"] = &config.Resource{
 			Attributes: make([]config.ResourceAttribute, 0),
 		}
 	}
 
-	if oc.config.Collector.Processors.Resource["default"] != nil &&
+	if cfg.Collector.Processors.Resource["default"] != nil &&
 		resourceUpdateContext.GetResourceId() != "" {
 		resourceProcessorUpdated = oc.updateResourceAttributes(
+			cfg,
 			[]config.ResourceAttribute{
 				{
 					Key:    "resource.id", //nolint:goconst // value is local to this function
@@ -399,14 +875,15 @@ func (oc *Collector) updateResourceProcessor(resourceUpdateContext *v1.Resource)
 
 func (oc *Collector) updateHeadersSetterExtension(
 	ctx context.Context,
+	cfg *config.Config,
 	resourceUpdateContext *v1.Resource,
 ) bool {
 	headersSetterExtensionUpdated := false
 
-	if oc.config.Collector.Extensions.HeadersSetter != nil &&
-		oc.config.Collector.Extensions.HeadersSetter.Headers != nil {
+	if cfg.Collector.Extensions.HeadersSetter != nil &&
+		cfg.Collector.Extensions.HeadersSetter.Headers != nil {
 		isUUIDHeaderSet := false
-		for _, header := range oc.config.Collector.Extensions.HeadersSetter.Headers {
+		for _, header := range cfg.Collector.Extensions.HeadersSetter.Headers {
 			if header.Key == "uuid" { //nolint:goconst // value is local to this function
 				isUUIDHeaderSet = true
 				break
@@ -418,8 +895,8 @@ func (oc *Collector) updateHeadersSetterExtension(
 				ctx, "Adding uuid header to OTel collector",
 				"uuid", resourceUpdateContext.GetResourceId(),
 			)
-			oc.config.Collector.Extensions.HeadersSetter.Headers = append(
-				oc.config.Collector.Extensions.HeadersSetter.Headers,
+			cfg.Collector.Extensions.HeadersSetter.Headers = append(
+				cfg.Collector.Extensions.HeadersSetter.Headers,
 				config.Header{
 					Action: insertAction,
 					Key:    "uuid",
@@ -459,63 +936,25 @@ func (oc *Collector) writeRunningConfig(ctx context.Context, settings otelcol.Co
 	return nil
 }
 
-func (oc *Collector) restartCollector(ctx context.Context) {
-	err := oc.shutdownCollector(ctx)
-	if err != nil {
-		slog.ErrorContext(ctx, "Failed to shutdown OTel Collector", "error", err)
-		return
-	}
-
-	settings := OTelCollectorSettings(oc.config)
-
-	if strings.ToLower(oc.config.Log.Level) == "debug" { //nolint:goconst // value is local to this function
-		writeErr := oc.writeRunningConfig(ctx, settings)
-		if writeErr != nil {
-			slog.ErrorContext(ctx, "Failed to write debug OTel Collector config", "error", writeErr)
-		}
-	}
-
-	oTelCollector, err := otelcol.NewCollector(settings)
-	if err != nil {
-		slog.ErrorContext(ctx, "Failed to create OTel Collector", "error", err)
-		return
-	}
-	oc.service = oTelCollector
-
-	if oc.config.IsCommandServerProxyConfigured() {
-		oc.setProxyIfNeeded(ctx)
-	}
-
-	var runCtx context.Context
-	runCtx, oc.cancel = context.WithCancel(ctx)
-
-	if !oc.stopped {
-		slog.ErrorContext(ctx, "Unable to restart OTel collector, failed to stop collector")
-		return
-	}
-
-	slog.InfoContext(ctx, "Restarting OTel collector")
-	bootErr := oc.bootup(runCtx)
-	if bootErr != nil {
-		slog.ErrorContext(runCtx, "Unable to start OTel Collector", "error", bootErr)
-	}
-}
-
-func (oc *Collector) setProxyIfNeeded(ctx context.Context) {
-	if oc.config.Collector.Exporters.OtlpExporters != nil ||
-		oc.config.Collector.Exporters.PrometheusExporter != nil {
+func (oc *Collector) setProxyIfNeeded(ctx context.Context, conf *config.Config) {
+	if conf.Collector.Exporters.OtlpExporters != nil ||
+		conf.Collector.Exporters.PrometheusExporter != nil {
 		// Set proxy env vars for OTLP exporter if proxy is configured.
-		oc.setExporterProxyEnvVars(ctx)
+		oc.setExporterProxyEnvVars(ctx, conf)
 	}
 }
 
-func (oc *Collector) checkForNewReceivers(ctx context.Context, nginxConfigContext *model.NginxConfigContext) bool {
-	nginxReceiverFound, reloadCollector := oc.updateExistingNginxPlusReceiver(nginxConfigContext)
+func (oc *Collector) checkForNewReceivers(
+	ctx context.Context,
+	cfg *config.Config,
+	nginxConfigContext *model.NginxConfigContext,
+) bool {
+	nginxReceiverFound, reloadCollector := oc.updateExistingNginxPlusReceiver(cfg, nginxConfigContext)
 
 	if !nginxReceiverFound && nginxConfigContext.PlusAPI.URL != "" {
 		slog.DebugContext(ctx, "Adding new NGINX Plus receiver", "url", nginxConfigContext.PlusAPI.URL)
-		oc.config.Collector.Receivers.NginxPlusReceivers = append(
-			oc.config.Collector.Receivers.NginxPlusReceivers,
+		cfg.Collector.Receivers.NginxPlusReceivers = append(
+			cfg.Collector.Receivers.NginxPlusReceivers,
 			config.NginxPlusReceiver{
 				InstanceID: nginxConfigContext.InstanceID,
 				PlusAPI: config.APIDetails{
@@ -532,35 +971,39 @@ func (oc *Collector) checkForNewReceivers(ctx context.Context, nginxConfigContex
 		reloadCollector = true
 	} else if nginxConfigContext.PlusAPI.URL == "" {
 		slog.WarnContext(ctx, "NGINX Plus API is not configured, searching for stub status endpoint")
-		reloadCollector = oc.addNginxOssReceiver(ctx, nginxConfigContext)
+		reloadCollector = oc.addNginxOssReceiver(ctx, cfg, nginxConfigContext)
 	}
 
-	if oc.config.IsFeatureEnabled(pkgConfig.FeatureLogsNap) {
-		tcplogReceiversFound := oc.updateNginxAppProtectTcplogReceivers(ctx, nginxConfigContext)
+	if cfg.IsFeatureEnabled(pkgConfig.FeatureLogsNap) {
+		tcplogReceiversFound := oc.updateNginxAppProtectTcplogReceivers(ctx, cfg, nginxConfigContext)
 		if tcplogReceiversFound {
 			reloadCollector = true
 		}
 	} else {
-		slog.DebugContext(ctx, "NAP logs feature disabled", "enabled_features", oc.config.Features)
+		slog.DebugContext(ctx, "NAP logs feature disabled", "enabled_features", cfg.Features)
 	}
 
-	if oc.config.Collector.Receivers.CertificateMetrics != nil {
-		reloadCollector = reloadCollector || oc.updateCertificateReceivers(nginxConfigContext)
-	} else if len(oc.config.Collector.Receivers.CertificateReceivers) > 0 {
-		oc.config.Collector.Receivers.CertificateReceivers = nil
+	if cfg.Collector.Receivers.CertificateMetrics != nil {
+		reloadCollector = reloadCollector || oc.updateCertificateReceivers(cfg, nginxConfigContext)
+	} else if len(cfg.Collector.Receivers.CertificateReceivers) > 0 {
+		cfg.Collector.Receivers.CertificateReceivers = nil
 		reloadCollector = true
 	}
 
 	return reloadCollector
 }
 
-func (oc *Collector) addNginxOssReceiver(ctx context.Context, nginxConfigContext *model.NginxConfigContext) bool {
-	nginxReceiverFound, reloadCollector := oc.updateExistingNginxOSSReceiver(nginxConfigContext)
+func (oc *Collector) addNginxOssReceiver(
+	ctx context.Context,
+	cfg *config.Config,
+	nginxConfigContext *model.NginxConfigContext,
+) bool {
+	nginxReceiverFound, reloadCollector := oc.updateExistingNginxOSSReceiver(cfg, nginxConfigContext)
 
 	if !nginxReceiverFound && nginxConfigContext.StubStatus.URL != "" {
 		slog.DebugContext(ctx, "Adding new NGINX OSS receiver", "url", nginxConfigContext.StubStatus.URL)
-		oc.config.Collector.Receivers.NginxReceivers = append(
-			oc.config.Collector.Receivers.NginxReceivers,
+		cfg.Collector.Receivers.NginxReceivers = append(
+			cfg.Collector.Receivers.NginxReceivers,
 			config.NginxReceiver{
 				InstanceID: nginxConfigContext.InstanceID,
 				StubStatus: config.APIDetails{
@@ -583,23 +1026,24 @@ func (oc *Collector) addNginxOssReceiver(ctx context.Context, nginxConfigContext
 }
 
 func (oc *Collector) updateExistingNginxPlusReceiver(
+	cfg *config.Config,
 	nginxConfigContext *model.NginxConfigContext,
 ) (nginxReceiverFound, reloadCollector bool) {
-	for index, nginxPlusReceiver := range oc.config.Collector.Receivers.NginxPlusReceivers {
+	for index, nginxPlusReceiver := range cfg.Collector.Receivers.NginxPlusReceivers {
 		if nginxPlusReceiver.InstanceID == nginxConfigContext.InstanceID {
 			nginxReceiverFound = true
 
 			if nginxPlusReceiver.PlusAPI.URL != nginxConfigContext.PlusAPI.URL {
-				oc.config.Collector.Receivers.NginxPlusReceivers = append(
-					oc.config.Collector.Receivers.NginxPlusReceivers[:index],
-					oc.config.Collector.Receivers.NginxPlusReceivers[index+1:]...,
+				cfg.Collector.Receivers.NginxPlusReceivers = append(
+					cfg.Collector.Receivers.NginxPlusReceivers[:index],
+					cfg.Collector.Receivers.NginxPlusReceivers[index+1:]...,
 				)
 				if nginxConfigContext.PlusAPI.URL != "" {
 					slog.Debug("Updating existing NGINX Plus receiver", "url",
 						nginxConfigContext.PlusAPI.URL)
 					nginxPlusReceiver.PlusAPI.URL = nginxConfigContext.PlusAPI.URL
-					oc.config.Collector.Receivers.NginxPlusReceivers = append(
-						oc.config.Collector.Receivers.NginxPlusReceivers,
+					cfg.Collector.Receivers.NginxPlusReceivers = append(
+						cfg.Collector.Receivers.NginxPlusReceivers,
 						nginxPlusReceiver,
 					)
 				}
@@ -616,16 +1060,17 @@ func (oc *Collector) updateExistingNginxPlusReceiver(
 }
 
 func (oc *Collector) updateExistingNginxOSSReceiver(
+	cfg *config.Config,
 	nginxConfigContext *model.NginxConfigContext,
 ) (nginxReceiverFound, reloadCollector bool) {
-	for index, nginxReceiver := range oc.config.Collector.Receivers.NginxReceivers {
+	for index, nginxReceiver := range cfg.Collector.Receivers.NginxReceivers {
 		if nginxReceiver.InstanceID == nginxConfigContext.InstanceID {
 			nginxReceiverFound = true
 
 			if isOSSReceiverChanged(nginxReceiver, nginxConfigContext) {
-				oc.config.Collector.Receivers.NginxReceivers = append(
-					oc.config.Collector.Receivers.NginxReceivers[:index],
-					oc.config.Collector.Receivers.NginxReceivers[index+1:]...,
+				cfg.Collector.Receivers.NginxReceivers = append(
+					cfg.Collector.Receivers.NginxReceivers[:index],
+					cfg.Collector.Receivers.NginxReceivers[index+1:]...,
 				)
 				if nginxConfigContext.StubStatus.URL != "" {
 					slog.Debug("Updating existing NGINX OSS receiver", "url",
@@ -636,8 +1081,8 @@ func (oc *Collector) updateExistingNginxOSSReceiver(
 						Location: nginxConfigContext.StubStatus.Location,
 					}
 					nginxReceiver.AccessLogs = toConfigAccessLog(nginxConfigContext.AccessLogs)
-					oc.config.Collector.Receivers.NginxReceivers = append(
-						oc.config.Collector.Receivers.NginxReceivers,
+					cfg.Collector.Receivers.NginxReceivers = append(
+						cfg.Collector.Receivers.NginxReceivers,
 						nginxReceiver,
 					)
 				}
@@ -655,19 +1100,21 @@ func (oc *Collector) updateExistingNginxOSSReceiver(
 
 //nolint:goconst // keeping map raw values to avoid overengineering
 func (oc *Collector) updateNginxAppProtectTcplogReceivers(
-	ctx context.Context, nginxConfigContext *model.NginxConfigContext,
+	ctx context.Context,
+	cfg *config.Config,
+	nginxConfigContext *model.NginxConfigContext,
 ) bool {
 	newTcplogReceiverAdded := false
 
-	if oc.config.Collector.Receivers.TcplogReceivers == nil {
-		oc.config.Collector.Receivers.TcplogReceivers = make(map[string]*config.TcplogReceiver)
+	if cfg.Collector.Receivers.TcplogReceivers == nil {
+		cfg.Collector.Receivers.TcplogReceivers = make(map[string]*config.TcplogReceiver)
 	}
 
 	napSysLogServer := oc.findAvailableSyslogServer(ctx, nginxConfigContext.NAPSysLogServer)
 
 	if napSysLogServer != "" {
-		if !oc.doesTcplogReceiverAlreadyExist(napSysLogServer) {
-			oc.config.Collector.Receivers.TcplogReceivers["nginx_app_protect"] = &config.TcplogReceiver{
+		if !oc.doesTcplogReceiverAlreadyExist(cfg, napSysLogServer) {
+			cfg.Collector.Receivers.TcplogReceivers["nginx_app_protect"] = &config.TcplogReceiver{
 				ListenAddress: napSysLogServer,
 				Operators: []config.Operator{
 					// regex captures the priority number from the log line
@@ -728,25 +1175,25 @@ func (oc *Collector) updateNginxAppProtectTcplogReceivers(
 		}
 	}
 
-	tcplogReceiverDeleted := oc.areNapReceiversDeleted(napSysLogServer)
+	tcplogReceiverDeleted := oc.areNapReceiversDeleted(cfg, napSysLogServer)
 
 	return newTcplogReceiverAdded || tcplogReceiverDeleted
 }
 
-func (oc *Collector) areNapReceiversDeleted(napSysLogServer string) bool {
-	listenAddressesToBeDeleted := oc.configDeletedNapReceivers(napSysLogServer)
+func (oc *Collector) areNapReceiversDeleted(cfg *config.Config, napSysLogServer string) bool {
+	listenAddressesToBeDeleted := oc.configDeletedNapReceivers(cfg, napSysLogServer)
 	if len(listenAddressesToBeDeleted) != 0 {
-		delete(oc.config.Collector.Receivers.TcplogReceivers, "nginx_app_protect")
+		delete(cfg.Collector.Receivers.TcplogReceivers, "nginx_app_protect")
 		return true
 	}
 
 	return false
 }
 
-func (oc *Collector) configDeletedNapReceivers(napSysLogServer string) map[string]bool {
+func (oc *Collector) configDeletedNapReceivers(cfg *config.Config, napSysLogServer string) map[string]bool {
 	elements := make(map[string]bool)
 
-	for _, tcplogReceiver := range oc.config.Collector.Receivers.TcplogReceivers {
+	for _, tcplogReceiver := range cfg.Collector.Receivers.TcplogReceivers {
 		elements[tcplogReceiver.ListenAddress] = true
 	}
 
@@ -762,8 +1209,8 @@ func (oc *Collector) configDeletedNapReceivers(napSysLogServer string) map[strin
 	return elements
 }
 
-func (oc *Collector) doesTcplogReceiverAlreadyExist(listenAddress string) bool {
-	for _, tcplogReceiver := range oc.config.Collector.Receivers.TcplogReceivers {
+func (oc *Collector) doesTcplogReceiverAlreadyExist(cfg *config.Config, listenAddress string) bool {
+	for _, tcplogReceiver := range cfg.Collector.Receivers.TcplogReceivers {
 		if listenAddress == tcplogReceiver.ListenAddress {
 			return true
 		}
@@ -774,15 +1221,18 @@ func (oc *Collector) doesTcplogReceiverAlreadyExist(listenAddress string) bool {
 
 // updateCertificateReceivers adds, removes, or restarts the certificate receiver for an instance.
 // It compares cert metadata from CertificateMeta to detect in-place cert renewals.
-func (oc *Collector) updateCertificateReceivers(nginxConfigContext *model.NginxConfigContext) bool {
+func (oc *Collector) updateCertificateReceivers(
+	cfg *config.Config,
+	nginxConfigContext *model.NginxConfigContext,
+) bool {
 	certMeta := certMetaFromFiles(nginxConfigContext.Files)
 
-	for i, certReceiver := range oc.config.Collector.Receivers.CertificateReceivers {
+	for i, certReceiver := range cfg.Collector.Receivers.CertificateReceivers {
 		if certReceiver.InstanceID == nginxConfigContext.InstanceID {
 			if len(certMeta) == 0 {
-				oc.config.Collector.Receivers.CertificateReceivers = append(
-					oc.config.Collector.Receivers.CertificateReceivers[:i],
-					oc.config.Collector.Receivers.CertificateReceivers[i+1:]...,
+				cfg.Collector.Receivers.CertificateReceivers = append(
+					cfg.Collector.Receivers.CertificateReceivers[:i],
+					cfg.Collector.Receivers.CertificateReceivers[i+1:]...,
 				)
 
 				return true
@@ -792,7 +1242,7 @@ func (oc *Collector) updateCertificateReceivers(nginxConfigContext *model.NginxC
 				return false
 			}
 
-			oc.config.Collector.Receivers.CertificateReceivers[i].CertMeta = certMeta
+			cfg.Collector.Receivers.CertificateReceivers[i].CertMeta = certMeta
 
 			return true
 		}
@@ -802,11 +1252,11 @@ func (oc *Collector) updateCertificateReceivers(nginxConfigContext *model.NginxC
 		return false
 	}
 
-	oc.config.Collector.Receivers.CertificateReceivers = append(
-		oc.config.Collector.Receivers.CertificateReceivers,
+	cfg.Collector.Receivers.CertificateReceivers = append(
+		cfg.Collector.Receivers.CertificateReceivers,
 		config.CertificateReceiver{
 			InstanceID:         nginxConfigContext.InstanceID,
-			CollectionInterval: oc.config.Collector.Receivers.CertificateMetrics.CollectionInterval,
+			CollectionInterval: cfg.Collector.Receivers.CertificateMetrics.CollectionInterval,
 			CertMeta:           certMeta,
 		},
 	)
@@ -835,20 +1285,21 @@ func certMetaFromFiles(files []*v1.File) map[string]config.CertMeta {
 }
 
 func (oc *Collector) updateResourceAttributes(
+	cfg *config.Config,
 	attributesToAdd []config.ResourceAttribute,
 ) (actionUpdated bool) {
 	actionUpdated = false
 
-	if oc.config.Collector.Processors.Resource["default"].Attributes != nil {
+	if cfg.Collector.Processors.Resource["default"].Attributes != nil {
 	OUTER:
 		for _, toAdd := range attributesToAdd {
-			for _, action := range oc.config.Collector.Processors.Resource["default"].Attributes {
+			for _, action := range cfg.Collector.Processors.Resource["default"].Attributes {
 				if action.Key == toAdd.Key {
 					continue OUTER
 				}
 			}
-			oc.config.Collector.Processors.Resource["default"].Attributes = append(
-				oc.config.Collector.Processors.Resource["default"].Attributes,
+			cfg.Collector.Processors.Resource["default"].Attributes = append(
+				cfg.Collector.Processors.Resource["default"].Attributes,
 				toAdd,
 			)
 			actionUpdated = true
@@ -858,16 +1309,16 @@ func (oc *Collector) updateResourceAttributes(
 	return actionUpdated
 }
 
-func (oc *Collector) findAvailableSyslogServer(ctx context.Context, napSyslogServer string) string {
+func (oc *Collector) findAvailableSyslogServer(ctx context.Context, napSysLogServer string) string {
 	if oc.previousNAPSysLogServer != "" &&
-		normaliseAddress(oc.previousNAPSysLogServer) == normaliseAddress(napSyslogServer) {
-		return napSyslogServer
+		normaliseAddress(oc.previousNAPSysLogServer) == normaliseAddress(napSysLogServer) {
+		return napSysLogServer
 	}
 
 	listenConfig := &net.ListenConfig{}
-	ln, err := listenConfig.Listen(ctx, "tcp", napSyslogServer)
+	ln, err := listenConfig.Listen(ctx, "tcp", napSysLogServer)
 	if err != nil {
-		slog.DebugContext(ctx, "NAP syslog server is not reachable", "address", napSyslogServer,
+		slog.DebugContext(ctx, "NAP syslog server is not reachable", "address", napSysLogServer,
 			"error", err)
 
 		return ""
@@ -875,12 +1326,12 @@ func (oc *Collector) findAvailableSyslogServer(ctx context.Context, napSyslogSer
 
 	closeError := ln.Close()
 	if closeError != nil {
-		slog.DebugContext(ctx, "Failed to close syslog server", "address", napSyslogServer, "error", closeError)
+		slog.DebugContext(ctx, "Failed to close syslog server", "address", napSysLogServer, "error", closeError)
 	}
 
-	oc.previousNAPSysLogServer = napSyslogServer
+	oc.previousNAPSysLogServer = napSysLogServer
 
-	return napSyslogServer
+	return napSysLogServer
 }
 
 func isOSSReceiverChanged(nginxReceiver config.NginxReceiver, nginxConfigContext *model.NginxConfigContext) bool {
@@ -911,8 +1362,8 @@ func escapeString(input string) string {
 	return output
 }
 
-func (oc *Collector) setExporterProxyEnvVars(ctx context.Context) {
-	proxy := oc.config.Command.Server.Proxy
+func (oc *Collector) setExporterProxyEnvVars(ctx context.Context, conf *config.Config) {
+	proxy := conf.Command.Server.Proxy
 	proxyURL := proxy.URL
 	parsedProxyURL, err := url.Parse(proxyURL)
 	if err != nil {
@@ -987,4 +1438,25 @@ func normaliseAddress(address string) string {
 	}
 
 	return net.JoinHostPort(host, port)
+}
+
+// copyOf returns a deep, independent copy of v (or its typed zero value when v
+// is nil or cannot be represented as T). It is a typed wrapper around
+// deepCopyValue.
+//
+//nolint:ireturn // generic helper must return the parameterized type T
+func copyOf[T any](v T) T {
+	copied := deepCopyValue(reflect.ValueOf(v))
+	if !copied.IsValid() {
+		var zero T
+		return zero
+	}
+
+	result, ok := copied.Interface().(T)
+	if !ok {
+		var zero T
+		return zero
+	}
+
+	return result
 }

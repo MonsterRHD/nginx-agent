@@ -8,11 +8,14 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"net/url"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/nginx/agent/v3/test/protos"
 	"github.com/nginx/agent/v3/test/stub"
@@ -310,6 +313,17 @@ func TestCollector_ProcessNginxConfigUpdateTopic(t *testing.T) {
 			conf.Collector.Extensions.Health = nil
 			conf.Collector.Extensions.HeadersSetter = nil
 			conf.Collector.Exporters.PrometheusExporter = nil
+			// Only the OTLP exporter remains and processors are stripped, so
+			// use a pipeline that only references the discovered NGINX
+			// receivers and the configured OTLP exporter. The candidate must
+			// validate before the collector is switched over.
+			conf.Collector.Pipelines.Logs = nil
+			conf.Collector.Pipelines.Metrics = map[string]*config.Pipeline{
+				"default": {
+					Receivers: []string{"nginx_metrics"},
+					Exporters: []string{"otlp_grpc/default"},
+				},
+			}
 
 			collector, err := NewCollector(conf)
 			require.NoError(tt, err, "NewCollector should not return an error with valid config")
@@ -351,6 +365,14 @@ func TestCollector_ProcessResourceUpdateTopic(t *testing.T) {
 			Ca:         "",
 			ServerName: "",
 			SkipVerify: false,
+		},
+	}
+	// The batch processor and OTLP exporter were removed, so the pipeline must
+	// only reference the remaining components for the candidate to validate.
+	conf.Collector.Pipelines.Metrics = map[string]*config.Pipeline{
+		"default": {
+			Receivers: []string{"host_metrics"},
+			Exporters: []string{"prometheus"},
 		},
 	}
 
@@ -438,6 +460,12 @@ func TestCollector_ProcessResourceUpdateTopicFails(t *testing.T) {
 			Ca:         "",
 			ServerName: "",
 			SkipVerify: false,
+		},
+	}
+	conf.Collector.Pipelines.Metrics = map[string]*config.Pipeline{
+		"default": {
+			Receivers: []string{"host_metrics"},
+			Exporters: []string{"prometheus"},
 		},
 	}
 
@@ -582,7 +610,9 @@ func TestCollector_updateExistingNginxOSSReceiver(t *testing.T) {
 
 			collector.service = createFakeCollector()
 
-			nginxReceiverFound, reloadCollector := collector.updateExistingNginxOSSReceiver(test.nginxConfigContext)
+			nginxReceiverFound, reloadCollector := collector.updateExistingNginxOSSReceiver(
+				collector.config, test.nginxConfigContext,
+			)
 
 			assert.True(tt, nginxReceiverFound)
 			assert.True(tt, reloadCollector)
@@ -672,7 +702,9 @@ func TestCollector_updateExistingNginxPlusReceiver(t *testing.T) {
 
 			collector.service = createFakeCollector()
 
-			nginxReceiverFound, reloadCollector := collector.updateExistingNginxPlusReceiver(test.nginxConfigContext)
+			nginxReceiverFound, reloadCollector := collector.updateExistingNginxPlusReceiver(
+				collector.config, test.nginxConfigContext,
+			)
 
 			assert.True(tt, nginxReceiverFound)
 			assert.True(tt, reloadCollector)
@@ -731,7 +763,7 @@ func TestCollector_updateResourceAttributes(t *testing.T) {
 			conf.Collector.Processors.Resource = make(map[string]*config.Resource)
 			conf.Collector.Processors.Resource["default"] = &config.Resource{Attributes: test.setup}
 
-			reloadRequired := collector.updateResourceAttributes(test.attributes)
+			reloadRequired := collector.updateResourceAttributes(collector.config, test.attributes)
 			assert.Equal(tt,
 				test.expectedAttribs,
 				conf.Collector.Processors.Resource["default"].Attributes)
@@ -758,7 +790,7 @@ func TestCollector_updateNginxAppProtectTcplogReceivers(t *testing.T) {
 	assert.Empty(t, conf.Collector.Receivers.TcplogReceivers)
 
 	t.Run("Test 1: NewCollector TcplogReceiver added", func(tt *testing.T) {
-		tcplogReceiverAdded := collector.updateNginxAppProtectTcplogReceivers(ctx, nginxConfigContext)
+		tcplogReceiverAdded := collector.updateNginxAppProtectTcplogReceivers(ctx, collector.config, nginxConfigContext)
 
 		assert.True(tt, tcplogReceiverAdded)
 		assert.Len(tt, conf.Collector.Receivers.TcplogReceivers, 1)
@@ -769,7 +801,7 @@ func TestCollector_updateNginxAppProtectTcplogReceivers(t *testing.T) {
 	// Calling updateNginxAppProtectTcplogReceivers shouldn't update the TcplogReceivers slice
 	// since there is already a receiver with the same ListenAddress
 	t.Run("Test 2: TcplogReceiver already exists", func(tt *testing.T) {
-		tcplogReceiverAdded := collector.updateNginxAppProtectTcplogReceivers(ctx, nginxConfigContext)
+		tcplogReceiverAdded := collector.updateNginxAppProtectTcplogReceivers(ctx, collector.config, nginxConfigContext)
 		assert.False(t, tcplogReceiverAdded)
 		assert.Len(t, conf.Collector.Receivers.TcplogReceivers, 1)
 		assert.Equal(t, "localhost:15632", conf.Collector.Receivers.TcplogReceivers["nginx_app_protect"].ListenAddress)
@@ -777,13 +809,15 @@ func TestCollector_updateNginxAppProtectTcplogReceivers(t *testing.T) {
 	})
 
 	t.Run("Test 3: TcplogReceiver deleted", func(tt *testing.T) {
-		tcplogReceiverDeleted := collector.updateNginxAppProtectTcplogReceivers(ctx, &model.NginxConfigContext{})
+		tcplogReceiverDeleted := collector.updateNginxAppProtectTcplogReceivers(ctx,
+			collector.config, &model.NginxConfigContext{})
 		assert.True(t, tcplogReceiverDeleted)
 		assert.Empty(t, conf.Collector.Receivers.TcplogReceivers)
 	})
 
 	t.Run("Test 4: NewCollector tcplogReceiver added and deleted another", func(tt *testing.T) {
 		tcplogReceiverDeleted := collector.updateNginxAppProtectTcplogReceivers(ctx,
+			collector.config,
 			&model.NginxConfigContext{
 				NAPSysLogServer: "localhost:1555",
 			},
@@ -909,7 +943,7 @@ func TestSetExporterProxyEnvVars(t *testing.T) {
 			collector, err := NewCollector(cfg)
 			require.NoError(t, err)
 
-			collector.setExporterProxyEnvVars(ctx)
+			collector.setExporterProxyEnvVars(ctx, cfg)
 
 			helpers.ValidateLog(t, tt.expectedLog, logBuf)
 
@@ -931,7 +965,7 @@ func TestSetExporterProxyEnvVars_HTTPSSchemeNotSet(t *testing.T) {
 	}
 
 	collector := &Collector{config: agentConfig}
-	collector.setExporterProxyEnvVars(t.Context())
+	collector.setExporterProxyEnvVars(t.Context(), agentConfig)
 
 	assert.Empty(t, os.Getenv("HTTPS_PROXY"),
 		"HTTPS_PROXY must not be set when proxy scheme is https (unsupported)")
@@ -1240,7 +1274,7 @@ func TestUpdateCertificateReceivers(t *testing.T) {
 				Files:      tt.files,
 			}
 
-			got := oc.updateCertificateReceivers(ctx)
+			got := oc.updateCertificateReceivers(oc.config, ctx)
 			assert.Equal(t, tt.expectedRestart, got)
 			assert.Len(t, oc.config.Collector.Receivers.CertificateReceivers, tt.expectedRecvs)
 
@@ -1249,6 +1283,332 @@ func TestUpdateCertificateReceivers(t *testing.T) {
 			}
 		})
 	}
+}
+
+// runningFakeCollector builds a Collector whose confirmed config is published
+// to disk and whose last healthy pipeline is represented by the provided fake.
+func runningFakeCollector(
+	t *testing.T,
+	conf *config.Config,
+	fake *typesfakes.FakeCollectorInterface,
+) *Collector {
+	t.Helper()
+
+	conf.Collector.Log.Path = ""
+
+	require.NoError(t, writeCollectorConfig(conf.Collector), "publish last healthy config")
+
+	collector, err := NewCollector(conf)
+	require.NoError(t, err)
+
+	collector.service = fake
+	collector.stopped = false
+
+	return collector
+}
+
+func TestDeepCopyConfig_Independent(t *testing.T) {
+	conf := types.OTelConfig(t)
+	conf.Labels = map[string]any{"env": "test"}
+
+	copy1 := deepCopyConfig(conf)
+	require.NotSame(t, conf, copy1)
+
+	copy1.Collector.Receivers.OtlpReceivers["default"].Server.Port = 9999
+	copy1.Collector.Pipelines.Metrics["default"].Receivers = append(
+		copy1.Collector.Pipelines.Metrics["default"].Receivers, "extra",
+	)
+	copy1.Labels["new"] = "label"
+	copy1.Collector.Extensions.HeadersSetter.Headers[0].Value = "changed"
+
+	assert.NotEqual(t, 9999, conf.Collector.Receivers.OtlpReceivers["default"].Server.Port)
+	assert.NotContains(t, conf.Collector.Pipelines.Metrics["default"].Receivers, "extra")
+	assert.NotContains(t, conf.Labels, "new")
+	assert.NotEqual(t, "changed", conf.Collector.Extensions.HeadersSetter.Headers[0].Value)
+
+	// A second copy must still match the untouched source in every field.
+	copy2 := deepCopyConfig(conf)
+	assert.Equal(t, conf, copy2)
+
+	assert.Nil(t, deepCopyConfig(nil))
+}
+
+func TestWriteCollectorConfig_LeavesNoTempFile(t *testing.T) {
+	conf := types.OTelConfig(t)
+
+	require.NoError(t, writeCollectorConfig(conf.Collector))
+
+	_, err := os.Stat(conf.Collector.ConfigPath)
+	require.NoError(t, err)
+
+	_, err = os.Stat(conf.Collector.ConfigPath + tempConfigSuffix)
+	assert.True(t, os.IsNotExist(err))
+}
+
+func TestNewCollector_RemovesStaleTempConfig(t *testing.T) {
+	conf := types.OTelConfig(t)
+	conf.Collector.Log.Path = ""
+	stalePath := conf.Collector.ConfigPath + tempConfigSuffix
+	require.NoError(t, os.WriteFile(stalePath, []byte("half-written config"), 0o600))
+
+	collector, err := NewCollector(conf)
+	require.NoError(t, err)
+
+	_, err = os.Stat(stalePath)
+	assert.True(t, os.IsNotExist(err), "stale temp config must be cleaned on agent start")
+	_ = collector
+}
+
+func TestApplyCandidate_InvalidCandidateKeepsLastHealthy(t *testing.T) {
+	conf := types.OTelConfig(t)
+	fake := createFakeCollector()
+	collector := runningFakeCollector(t, conf, fake)
+
+	candidate := deepCopyConfig(conf)
+	candidate.Collector.Pipelines.Metrics["default"].Processors = append(
+		candidate.Collector.Pipelines.Metrics["default"].Processors, "resource/missing",
+	)
+
+	err := collector.applyCandidate(context.Background(), candidate)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid OTel collector config candidate")
+
+	// The candidate was rejected before touching the running pipeline.
+	assert.Equal(t, 0, fake.ShutdownCallCount(), "last healthy collector must not be shut down")
+	assert.Same(t, conf, collector.config, "in-memory config must stay on the last healthy version")
+	assert.Equal(t, otelcol.StateRunning, collector.State())
+
+	_, statErr := os.Stat(conf.Collector.ConfigPath + tempConfigSuffix)
+	assert.True(t, os.IsNotExist(statErr), "no staging file may be left behind")
+
+	require.NoError(t, collector.Close(context.Background()))
+}
+
+func TestApplyCandidate_StageWriteFailureKeepsLastHealthy(t *testing.T) {
+	conf := types.OTelConfig(t)
+	conf.Collector.Log.Path = ""
+	conf.Collector.ConfigPath = filepath.Join(t.TempDir(), "missing-dir", "otel.yaml")
+
+	fake := createFakeCollector()
+	collector, err := NewCollector(conf)
+	require.NoError(t, err)
+	collector.service = fake
+	collector.stopped = false
+
+	candidate := deepCopyConfig(conf)
+	applyErr := collector.applyCandidate(context.Background(), candidate)
+	require.Error(t, applyErr)
+	assert.Contains(t, applyErr.Error(), "render OTel collector config candidate")
+
+	assert.Equal(t, 0, fake.ShutdownCallCount())
+	assert.Same(t, conf, collector.config)
+	assert.Equal(t, otelcol.StateRunning, collector.State())
+}
+
+func TestApplyCandidate_ShutdownTimeoutRestoresLastHealthy(t *testing.T) {
+	conf := types.OTelConfig(t)
+	conf.Client.Backoff.MaxElapsedTime = 250 * time.Millisecond
+
+	releaseShutdown := make(chan struct{})
+	fake := &typesfakes.FakeCollectorInterface{}
+	fake.RunStub = func(context.Context) error { return nil }
+	fake.GetStateStub = func() otelcol.State { return otelcol.StateRunning }
+	fake.ShutdownStub = func() {
+		<-releaseShutdown
+	}
+	t.Cleanup(func() { close(releaseShutdown) })
+
+	collector := runningFakeCollector(t, conf, fake)
+
+	candidate := deepCopyConfig(conf)
+	candidate.Collector.Receivers.HostMetrics.InitialDelay = 2 * time.Second
+
+	err := collector.applyCandidate(context.Background(), candidate)
+	require.Error(t, err)
+	require.ErrorIs(t, err, errCollectorShutdownTimedOut)
+
+	// Memory config and disk config stay on the last healthy version and a
+	// fresh collector serving that config is running again.
+	assert.Same(t, conf, collector.config)
+	assert.Equal(t, otelcol.StateRunning, collector.State(),
+		"last healthy pipeline must be re-provided after shutdown timeout")
+
+	_, statErr := os.Stat(conf.Collector.ConfigPath + tempConfigSuffix)
+	assert.True(t, os.IsNotExist(statErr))
+
+	require.NoError(t, collector.Close(context.Background()))
+}
+
+func TestApplyCandidate_NewBootFailureRollsBack(t *testing.T) {
+	conf := types.OTelConfig(t)
+	receiverHost := conf.Collector.Receivers.OtlpReceivers["default"].Server.Host
+	oldReceiverPort := conf.Collector.Receivers.OtlpReceivers["default"].Server.Port
+
+	fake := createFakeCollector()
+	collector := runningFakeCollector(t, conf, fake)
+
+	// Occupy a port so the new collector fails while starting its OTLP receiver.
+	listenConfig := &net.ListenConfig{}
+	ln, listenErr := listenConfig.Listen(context.Background(), "tcp",
+		receiverHost+":0")
+	require.NoError(t, listenErr)
+	listenerAddr, addrOK := ln.Addr().(*net.TCPAddr)
+	require.True(t, addrOK)
+	occupiedPort := listenerAddr.Port
+	t.Cleanup(func() { _ = ln.Close() })
+
+	candidate := deepCopyConfig(conf)
+	candidate.Collector.Receivers.OtlpReceivers["default"].Server.Port = occupiedPort
+	candidate.Collector.Pipelines.Metrics["default"].Receivers = []string{"host_metrics", "otlp/default"}
+
+	err := collector.applyCandidate(context.Background(), candidate)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "start new OTel collector")
+
+	// In-memory state reflects only the last healthy version.
+	assert.Same(t, conf, collector.config)
+	assert.Equal(t, oldReceiverPort,
+		collector.config.Collector.Receivers.OtlpReceivers["default"].Server.Port)
+	assert.Equal(t, otelcol.StateRunning, collector.State(),
+		"last healthy pipeline must be re-provided after failed start")
+
+	// Disk config was rolled back to the last healthy version with no
+	// half-written staging file.
+	diskData, readErr := os.ReadFile(conf.Collector.ConfigPath)
+	require.NoError(t, readErr)
+	assert.Contains(t, string(diskData), fmt.Sprintf("%s:%d", receiverHost, oldReceiverPort))
+	assert.NotContains(t, string(diskData), fmt.Sprintf("%s:%d", receiverHost, occupiedPort))
+
+	_, statErr := os.Stat(conf.Collector.ConfigPath + tempConfigSuffix)
+	assert.True(t, os.IsNotExist(statErr))
+
+	require.NoError(t, collector.Close(context.Background()))
+}
+
+func TestApplyUpdate_NoReceiversWaitsAndKeepsPipeline(t *testing.T) {
+	conf := types.OTelConfig(t)
+	fake := createFakeCollector()
+	collector := runningFakeCollector(t, conf, fake)
+
+	collector.applyUpdate(context.Background(), "receivers removed", func(candidate *config.Config) bool {
+		candidate.Collector.Receivers = config.Receivers{}
+		return true
+	})
+
+	assert.Equal(t, 0, fake.ShutdownCallCount(),
+		"candidate without receivers must not tear down the last healthy pipeline")
+	assert.Same(t, conf, collector.config)
+	assert.Equal(t, otelcol.StateRunning, collector.State())
+
+	require.NoError(t, collector.Close(context.Background()))
+}
+
+func TestApplyUpdate_SerializesConcurrentUpdates(t *testing.T) {
+	conf := types.OTelConfig(t)
+	fake := createFakeCollector()
+	collector := runningFakeCollector(t, conf, fake)
+	t.Cleanup(func() { _ = collector.Close(context.Background()) })
+
+	var wg sync.WaitGroup
+	for range 50 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			collector.applyUpdate(context.Background(), "noop", func(*config.Config) bool {
+				return false
+			})
+		}()
+	}
+	wg.Wait()
+
+	assert.Equal(t, 0, fake.ShutdownCallCount())
+}
+
+func TestReconfigure_NoReceiversWaitsForDiscovery(t *testing.T) {
+	conf := types.OTelConfig(t)
+	conf.Collector.Log.Path = ""
+	conf.Collector.Receivers = config.Receivers{}
+
+	fake := createFakeCollector()
+	collector, err := NewCollector(conf)
+	require.NoError(t, err)
+	collector.service = fake
+	t.Cleanup(func() { _ = collector.Close(context.Background()) })
+
+	updated := deepCopyConfig(conf)
+	updated.Collector.Extensions.HeadersSetter.Headers[0].Value = "new-token"
+
+	require.NoError(t, collector.Reconfigure(context.Background(), updated))
+	assert.Equal(t, 0, fake.ShutdownCallCount(), "no restart may happen while waiting for receivers")
+	assert.Same(t, conf, collector.config)
+}
+
+func TestReconfigure_PreservesRuntimeState(t *testing.T) {
+	conf := types.OTelConfig(t)
+	conf.Collector.Log.Path = ""
+	collector, err := NewCollector(conf)
+	require.NoError(t, err)
+
+	// Simulate runtime state accumulated on the last healthy config.
+	conf.Collector.Receivers.NginxReceivers = []config.NginxReceiver{
+		{InstanceID: "inst-1"},
+	}
+	conf.Collector.Receivers.TcplogReceivers = map[string]*config.TcplogReceiver{
+		"nginx_app_protect": {ListenAddress: "127.0.0.1:15632"},
+		"static_key":        {ListenAddress: "127.0.0.1:1"},
+	}
+	conf.Collector.Processors.Resource = map[string]*config.Resource{
+		"default": {
+			Attributes: []config.ResourceAttribute{
+				{Key: "resource.id", Action: "insert", Value: "r1"},
+			},
+		},
+	}
+	conf.Collector.Extensions.HeadersSetter.Headers = append(
+		conf.Collector.Extensions.HeadersSetter.Headers,
+		config.Header{Action: "insert", Key: "uuid", Value: "u1"},
+	)
+
+	candidate := deepCopyConfig(conf)
+
+	// A management plane config only carries statically configured pieces.
+	candidate.Collector.Receivers.NginxReceivers = nil
+	candidate.Collector.Receivers.NginxPlusReceivers = nil
+	candidate.Collector.Receivers.CertificateReceivers = nil
+	candidate.Collector.Receivers.TcplogReceivers = map[string]*config.TcplogReceiver{
+		"static_key": {ListenAddress: "127.0.0.1:1"},
+	}
+	candidate.Collector.Processors.Resource = nil
+	candidate.Collector.Extensions.HeadersSetter.Headers = []config.Header{
+		{Action: "insert", Key: "authorization", Value: "tok"},
+	}
+
+	collector.preserveRuntimeState(candidate)
+
+	require.Len(t, candidate.Collector.Receivers.NginxReceivers, 1)
+	assert.Equal(t, "inst-1", candidate.Collector.Receivers.NginxReceivers[0].InstanceID)
+
+	assert.Len(t, candidate.Collector.Receivers.TcplogReceivers, 2)
+	assert.Contains(t, candidate.Collector.Receivers.TcplogReceivers, "nginx_app_protect")
+	assert.Equal(t, "127.0.0.1:15632",
+		candidate.Collector.Receivers.TcplogReceivers["nginx_app_protect"].ListenAddress)
+	assert.Contains(t, candidate.Collector.Receivers.TcplogReceivers, "static_key")
+
+	require.Contains(t, candidate.Collector.Processors.Resource, "default")
+	assert.Equal(t, "r1",
+		candidate.Collector.Processors.Resource["default"].Attributes[0].Value)
+
+	headerKeys := make(map[string]bool)
+	for _, header := range candidate.Collector.Extensions.HeadersSetter.Headers {
+		headerKeys[header.Key] = true
+	}
+	assert.True(t, headerKeys["authorization"])
+	assert.True(t, headerKeys["uuid"])
+
+	// Carried state must be independent of the last healthy config.
+	candidate.Collector.Receivers.NginxReceivers[0].InstanceID = "other"
+	assert.Equal(t, "inst-1",
+		collector.config.Collector.Receivers.NginxReceivers[0].InstanceID)
 }
 
 func createFakeCollector() *typesfakes.FakeCollectorInterface {

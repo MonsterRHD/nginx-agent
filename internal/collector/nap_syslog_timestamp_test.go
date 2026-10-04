@@ -143,7 +143,7 @@ func buildNAPTimestampOperators(t *testing.T) []operator.Operator {
 	require.NoError(t, err)
 
 	require.True(t, collector.updateNginxAppProtectTcplogReceivers(context.Background(),
-		&model.NginxConfigContext{NAPSysLogServer: "localhost:15633"}))
+		collector.config, &model.NginxConfigContext{NAPSysLogServer: "localhost:15633"}))
 	receiver := conf.Collector.Receivers.TcplogReceivers["nginx_app_protect"]
 	require.NotNil(t, receiver)
 

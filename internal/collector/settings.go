@@ -5,12 +5,7 @@
 package collector
 
 import (
-	_ "embed"
 	"log/slog"
-	"os"
-	"path/filepath"
-	"slices"
-	"text/template"
 
 	"github.com/nginx/agent/v3/internal/config"
 	"go.opentelemetry.io/collector/confmap"
@@ -21,14 +16,6 @@ import (
 	"go.opentelemetry.io/collector/confmap/provider/yamlprovider"
 	"go.opentelemetry.io/collector/otelcol"
 )
-
-const (
-	otelTemplatePath     = "otelcol.tmpl"
-	configFilePermission = 0o600
-)
-
-//go:embed otelcol.tmpl
-var otelcolTemplate string
 
 func OTelCollectorSettings(cfg *config.Config) otelcol.CollectorSettings {
 	return otelcol.CollectorSettings{
@@ -71,88 +58,8 @@ func createConverterFactories() []confmap.ConverterFactory {
 }
 
 func createURIs(cfg *config.Config) []string {
-	configFiles := []string{cfg.Collector.ConfigPath}
-	configFiles = slices.Concat(configFiles, cfg.Collector.AdditionalConfigPaths)
+	configFiles := configURIs(cfg.Collector.ConfigPath, cfg.Collector.AdditionalConfigPaths)
 	slog.Info("Merging additional OTel config files", "config_files", configFiles)
 
 	return configFiles
-}
-
-func createFile(confPath string) error {
-	// Create if doesn't exist.
-	_, createErr := os.Create(confPath)
-	if createErr != nil {
-		return createErr
-	}
-
-	// Set the file permissions to 600.
-	permissionErr := os.Chmod(confPath, configFilePermission)
-	if permissionErr != nil {
-		return permissionErr
-	}
-
-	return nil
-}
-
-// Generates an OTel Collector config to a file by injecting the Metrics Config to a Go template.
-func writeCollectorConfig(conf *config.Collector) error {
-	confPath := filepath.Clean(conf.ConfigPath)
-
-	slog.Info("Writing OTel collector config", "config_path", confPath)
-
-	if conf.Processors.Resource["default"] != nil {
-		addDefaultResourceProcessor(conf.Pipelines.Metrics)
-		addDefaultResourceProcessor(conf.Pipelines.Logs)
-	}
-
-	for _, pipeline := range conf.Pipelines.Metrics {
-		if i := slices.Index(pipeline.Exporters, "otlp/default"); i != -1 {
-			pipeline.Exporters[i] = config.DefaultOtlpGrpc
-		}
-	}
-
-	otelcolTemplate, templateErr := template.New(otelTemplatePath).Parse(otelcolTemplate)
-	if templateErr != nil {
-		return templateErr
-	}
-
-	// Ensure file exists and has correct permissions
-	if err := ensureFileExists(confPath); err != nil {
-		return err
-	}
-
-	file, err := os.OpenFile(confPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, configFilePermission)
-	if err != nil {
-		return err
-	}
-	defer func() {
-		fileCloseErr := file.Close()
-		if fileCloseErr != nil {
-			slog.Warn("Failed to close file", "file_path", confPath, "error", fileCloseErr)
-		}
-	}()
-
-	return otelcolTemplate.Execute(file, conf)
-}
-
-func addDefaultResourceProcessor(pipelines map[string]*config.Pipeline) {
-	for _, pipeline := range pipelines {
-		if !slices.Contains(pipeline.Processors, "resource/default") {
-			pipeline.Processors = append(pipeline.Processors, "resource/default")
-		}
-	}
-}
-
-func ensureFileExists(confPath string) error {
-	_, err := os.Stat(confPath)
-	if err != nil {
-		if !os.IsNotExist(err) {
-			return err
-		}
-		if createFileErr := createFile(confPath); createFileErr != nil {
-			return createFileErr
-		}
-	}
-
-	return os.Chmod(confPath, configFilePermission)
 }
