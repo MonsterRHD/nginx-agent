@@ -29,6 +29,9 @@ var emptyEvent = fsnotify.Event{
 	Op:   0,
 }
 
+// globMagicPattern matches glob meta characters used by NGINX include directives.
+var globMagicPattern = regexp.MustCompile(`[*?[]`)
+
 type FileUpdateMessage struct {
 	CorrelationID slog.Attr
 }
@@ -141,8 +144,10 @@ func (fws *FileWatcherService) Update(ctx context.Context, nginxConfigContext *m
 		directoriesToWatch[filepath.Dir(file.GetFileMeta().GetName())] = struct{}{}
 	}
 
-	for _, file := range nginxConfigContext.Includes {
-		directoriesToWatch[filepath.Dir(file)] = struct{}{}
+	for _, include := range nginxConfigContext.Includes {
+		for _, directory := range includeDirectories(include) {
+			directoriesToWatch[directory] = struct{}{}
+		}
 	}
 
 	fws.directoriesToWatch = directoriesToWatch
@@ -293,6 +298,91 @@ func (fws *FileWatcherService) removeWatcher(ctx context.Context, path string) {
 func (fws *FileWatcherService) isEventSkippable(event fsnotify.Event) bool {
 	return event == emptyEvent ||
 		event.Name == "" || isExcludedFile(event.Name, fws.agentConfig.Watchers.FileWatcher.ExcludeFiles)
+}
+
+// includeDirectories returns the directories that must be watched for an include entry from a
+// parsed config. Plain includes are watched through their containing directory (the existing
+// behavior). Glob includes additionally watch the static pattern prefix and the parent directory
+// of every current match, so that files appearing in newly created glob matched directories
+// (for example sites/*/*.conf) trigger an update, and directories removed from the match set are
+// dropped from the watch list on the next confirmed snapshot.
+func includeDirectories(includePath string) []string {
+	if includePath == "" {
+		return nil
+	}
+
+	directories := make(map[string]struct{})
+
+	if !globMagicPattern.MatchString(includePath) {
+		directories[filepath.Dir(includePath)] = struct{}{}
+
+		return mapKeysSorted(directories)
+	}
+
+	// Highest directory without a glob meta segment; events here reveal new matching
+	// subdirectories before they are themselves watched.
+	directories[globStaticPrefix(includePath)] = struct{}{}
+
+	matches, err := filepath.Glob(includePath)
+	if err != nil {
+		slog.Debug("Unable to expand include glob while resolving watch directories",
+			"pattern", includePath, "error", err)
+
+		return mapKeysSorted(directories)
+	}
+
+	for _, match := range matches {
+		directories[filepath.Dir(match)] = struct{}{}
+	}
+
+	return mapKeysSorted(directories)
+}
+
+// globStaticPrefix returns the leading part of a glob pattern without glob meta characters.
+func globStaticPrefix(pattern string) string {
+	cleaned := filepath.Clean(pattern)
+	if !globMagicPattern.MatchString(cleaned) {
+		return filepath.Dir(cleaned)
+	}
+
+	leadingSlash := strings.HasPrefix(cleaned, string(os.PathSeparator))
+	parts := strings.Split(cleaned, string(os.PathSeparator))
+
+	prefixParts := make([]string, 0, len(parts))
+
+	for _, part := range parts {
+		if part == "" {
+			continue
+		}
+
+		if globMagicPattern.MatchString(part) {
+			break
+		}
+
+		prefixParts = append(prefixParts, part)
+	}
+
+	prefix := strings.Join(prefixParts, string(os.PathSeparator))
+	if leadingSlash {
+		prefix = string(os.PathSeparator) + prefix
+	}
+
+	if prefix == "" {
+		return filepath.Dir(cleaned)
+	}
+
+	return filepath.Clean(prefix)
+}
+
+func mapKeysSorted(set map[string]struct{}) []string {
+	keys := make([]string, 0, len(set))
+	for key := range set {
+		keys = append(keys, key)
+	}
+
+	slices.Sort(keys)
+
+	return keys
 }
 
 func isExcludedFile(path string, excludeFiles []string) bool {

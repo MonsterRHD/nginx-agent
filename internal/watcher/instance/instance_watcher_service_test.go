@@ -51,6 +51,7 @@ func TestInstanceWatcherService_checkForUpdates(t *testing.T) {
 	instanceWatcherService.nginxConfigParser = fakeNginxConfigParser
 	instanceWatcherService.instancesChannel = instanceUpdatesChannel
 	instanceWatcherService.nginxConfigContextChannel = nginxConfigContextChannel
+	instanceWatcherService.configSettlePeriod = 0
 
 	instanceWatcherService.checkForUpdates(ctx)
 
@@ -455,6 +456,8 @@ func TestInstanceWatcherService_ReparseConfigs_ContinuesOnParseError(t *testing.
 	instanceWatcherService.nginxConfigParser = fakeParser
 	instanceWatcherService.instancesChannel = make(chan ResourceUpdatesMessage, 2)
 	instanceWatcherService.nginxConfigContextChannel = make(chan NginxConfigContextMessage, 2)
+	instanceWatcherService.configSettlePeriod = 0
+	instanceWatcherService.configParseMaxAttempts = 1
 	instanceWatcherService.instanceCache = map[string]*mpi.Instance{
 		instance1.GetInstanceMeta().GetInstanceId(): instance1,
 		instance2.GetInstanceMeta().GetInstanceId(): instance2,

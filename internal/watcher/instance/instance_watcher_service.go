@@ -48,17 +48,29 @@ type (
 		nginxConfigParser              parser.ConfigParser
 		nginxParser                    processParser
 		executer                       exec.ExecInterface
-		enabled                        *atomic.Bool
 		agentConfig                    *config.Config
-		instanceCache                  map[string]*mpi.Instance
-		nginxConfigCache               map[string]*model.NginxConfigContext
-		instancesChannel               chan<- ResourceUpdatesMessage
-		nginxConfigContextChannel      chan<- NginxConfigContextMessage
 		info                           host.InfoInterface
 		resource                       *mpi.Resource
-		processCache                   []*nginxprocess.Process
-		cacheMutex                     sync.Mutex
-		resourceMutex                  sync.Mutex
+		enabled                        *atomic.Bool
+		instanceCache                  map[string]*mpi.Instance
+		nginxConfigCache               map[string]*model.NginxConfigContext
+		instancesChannel          chan<- ResourceUpdatesMessage
+		nginxConfigContextChannel chan<- NginxConfigContextMessage
+		// fingerprintGraphFunc overrides include graph fingerprinting; it is used by tests to
+		// deterministically simulate filesystem changes while reading a candidate.
+		fingerprintGraphFunc func(*resolvedConfigGraph) graphFingerprint
+		processCache         []*nginxprocess.Process
+
+		// configScanMutex serializes config scans triggered by filesystem events and periodic
+		// instance scans, so overlapping events coalesce into one stable config read.
+		// configSettlePeriod is the quiet period a candidate parse waits for batched writes or
+		// symlink switches to converge. configParseMaxAttempts bounds the number of candidate
+		// reads before the last confirmed snapshot is kept and another event is awaited.
+		cacheMutex             sync.Mutex
+		resourceMutex          sync.Mutex
+		configScanMutex        sync.Mutex
+		configSettlePeriod     time.Duration
+		configParseMaxAttempts int
 	}
 
 	InstanceUpdates struct {
@@ -97,6 +109,8 @@ func NewInstanceWatcherService(agentConfig *config.Config) *InstanceWatcherServi
 		resource:                       &mpi.Resource{},
 		enabled:                        enabled,
 		processCache:                   []*nginxprocess.Process{},
+		configSettlePeriod:             defaultConfigSettlePeriod,
+		configParseMaxAttempts:         defaultConfigParseMaxAttempts,
 	}
 
 	return instanceWatcherService
@@ -141,6 +155,15 @@ func (iw *InstanceWatcherService) Watch(
 func (iw *InstanceWatcherService) ReparseConfigs(ctx context.Context) {
 	slog.DebugContext(ctx, "Reparsing all instance configurations")
 
+	// Filesystem events can pile up while a batch of config files is being replaced. Coalesce
+	// overlapping reparses into a single stable read; later events trigger another reparse.
+	if !iw.configScanMutex.TryLock() {
+		slog.DebugContext(ctx, "Skipping config reparse, another config scan is already in progress")
+
+		return
+	}
+	defer iw.configScanMutex.Unlock()
+
 	iw.cacheMutex.Lock()
 	instances := make([]*mpi.Instance, 0, len(iw.instanceCache))
 	for _, instance := range iw.instanceCache {
@@ -150,7 +173,7 @@ func (iw *InstanceWatcherService) ReparseConfigs(ctx context.Context) {
 
 	for _, instance := range instances {
 		nginxConfigContext := &model.NginxConfigContext{}
-		var parseErr error
+
 		slog.DebugContext(
 			ctx,
 			"Reparsing NGINX instance config",
@@ -159,11 +182,16 @@ func (iw *InstanceWatcherService) ReparseConfigs(ctx context.Context) {
 
 		if instance.GetInstanceMeta().GetInstanceType() == mpi.InstanceMeta_INSTANCE_TYPE_NGINX ||
 			instance.GetInstanceMeta().GetInstanceType() == mpi.InstanceMeta_INSTANCE_TYPE_NGINX_PLUS {
-			nginxConfigContext, parseErr = iw.nginxConfigParser.Parse(ctx, instance)
+			// Only a stable, fully validated snapshot replaces the last confirmed state. A failed
+			// or unstable read (missing files, half-written content, include cycles, unreadable
+			// directories, ...) keeps the previous snapshot and the existing collection; another
+			// filesystem event retries the parse once the changes have converged.
+			parsedConfigContext, parseErr := iw.parseStableConfig(ctx, instance)
 			if parseErr != nil {
 				slog.WarnContext(
 					ctx,
-					"Failed to parse NGINX instance config",
+					"Failed to parse a stable NGINX config, keeping the last confirmed config and "+
+						"existing collection",
 					"config_path", instance.GetInstanceRuntime().GetConfigPath(),
 					"instance_id", instance.GetInstanceMeta().GetInstanceId(),
 					"error", parseErr,
@@ -171,6 +199,8 @@ func (iw *InstanceWatcherService) ReparseConfigs(ctx context.Context) {
 
 				continue
 			}
+
+			nginxConfigContext = parsedConfigContext
 		}
 
 		iw.HandleNginxConfigContextUpdate(ctx, instance.GetInstanceMeta().GetInstanceId(), nginxConfigContext)
@@ -225,38 +255,9 @@ func (iw *InstanceWatcherService) checkForUpdates(
 	instancesToParse := make([]*mpi.Instance, 0, len(instanceUpdates.UpdatedInstances))
 	instancesToParse = append(instancesToParse, instanceUpdates.UpdatedInstances...)
 
-	for _, newInstance := range instancesToParse {
-		instanceType := newInstance.GetInstanceMeta().GetInstanceType()
-		slog.DebugContext(
-			newCtx,
-			"Parsing instance config",
-			"instance_id", newInstance.GetInstanceMeta().GetInstanceId(),
-			"instance_type", instanceType,
-		)
-
-		if instanceType == mpi.InstanceMeta_INSTANCE_TYPE_NGINX ||
-			instanceType == mpi.InstanceMeta_INSTANCE_TYPE_NGINX_PLUS {
-			nginxConfigContext, parseErr := iw.nginxConfigParser.Parse(newCtx, newInstance)
-			if parseErr != nil {
-				slog.WarnContext(
-					newCtx,
-					"Unable to parse NGINX instance config",
-					"config_path", newInstance.GetInstanceRuntime().GetConfigPath(),
-					"instance_id", newInstance.GetInstanceMeta().GetInstanceId(),
-					"instance_type", instanceType,
-					"error", parseErr,
-				)
-			} else {
-				iw.cacheMutex.Lock()
-				iw.sendNginxConfigContextUpdate(newCtx, nginxConfigContext)
-				proto.UpdateNginxInstanceRuntime(newInstance, nginxConfigContext)
-
-				iw.nginxConfigCache[nginxConfigContext.InstanceID] = nginxConfigContext
-				iw.instanceCache[newInstance.GetInstanceMeta().GetInstanceId()] = newInstance
-				iw.cacheMutex.Unlock()
-			}
-		}
-	}
+	// A filesystem triggered reparse can still be reading a stable snapshot. Skip parsing this
+	// tick instead of mixing the two scans; the next periodic scan picks the instances up.
+	iw.parseUpdatedInstances(newCtx, instancesToParse)
 
 	if len(instanceUpdates.UpdatedInstances) > 0 {
 		iw.updateResourceInstanceList(ctx, instanceUpdates.UpdatedInstances)
@@ -269,6 +270,54 @@ func (iw *InstanceWatcherService) checkForUpdates(
 		case <-ctx.Done():
 			return
 		}
+	}
+}
+
+// parseUpdatedInstances parses configs of newly discovered instances through the stable snapshot
+// flow. Scans are serialized with filesystem triggered reparses so overlapping reads coalesce.
+func (iw *InstanceWatcherService) parseUpdatedInstances(ctx context.Context, instancesToParse []*mpi.Instance) {
+	if !iw.configScanMutex.TryLock() {
+		slog.DebugContext(ctx, "Skipping instance config parsing, a config scan is already in progress")
+
+		return
+	}
+	defer iw.configScanMutex.Unlock()
+
+	for _, newInstance := range instancesToParse {
+		instanceType := newInstance.GetInstanceMeta().GetInstanceType()
+		slog.DebugContext(
+			ctx,
+			"Parsing instance config",
+			"instance_id", newInstance.GetInstanceMeta().GetInstanceId(),
+			"instance_type", instanceType,
+		)
+
+		if instanceType != mpi.InstanceMeta_INSTANCE_TYPE_NGINX &&
+			instanceType != mpi.InstanceMeta_INSTANCE_TYPE_NGINX_PLUS {
+			continue
+		}
+
+		nginxConfigContext, parseErr := iw.parseStableConfig(ctx, newInstance)
+		if parseErr != nil {
+			slog.WarnContext(
+				ctx,
+				"Unable to parse a stable NGINX instance config, keeping the last confirmed config",
+				"config_path", newInstance.GetInstanceRuntime().GetConfigPath(),
+				"instance_id", newInstance.GetInstanceMeta().GetInstanceId(),
+				"instance_type", instanceType,
+				"error", parseErr,
+			)
+
+			continue
+		}
+
+		iw.cacheMutex.Lock()
+		iw.sendNginxConfigContextUpdate(ctx, nginxConfigContext)
+		proto.UpdateNginxInstanceRuntime(newInstance, nginxConfigContext)
+
+		iw.nginxConfigCache[nginxConfigContext.InstanceID] = nginxConfigContext
+		iw.instanceCache[newInstance.GetInstanceMeta().GetInstanceId()] = newInstance
+		iw.cacheMutex.Unlock()
 	}
 }
 

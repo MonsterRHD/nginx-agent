@@ -21,6 +21,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -84,7 +85,38 @@ type ConfigParser interface {
 	FindPlusAPI(ctx context.Context, nginxConfigContext *model.NginxConfigContext) *model.APIDetails
 }
 
-var _ ConfigParser = (*NginxConfigParser)(nil)
+// ConfigParserWithGraph is a ConfigParser that additionally returns the resolved include graph
+// of a parsed config. The graph is used to verify that every file, matched directory and symlink
+// target a parse depended on remained stable while the config was being read.
+type ConfigParserWithGraph interface {
+	ConfigParser
+	ParseWithGraph(ctx context.Context, instance *mpi.Instance) (*ParseResult, error)
+}
+
+// ConfigGraph describes the include graph that was resolved and read while parsing an NGINX
+// configuration. All paths are absolute.
+type ConfigGraph struct {
+	// RootPath is the absolute path of the root NGINX config file.
+	RootPath string
+	// Files contains every file read during the parse: the root config and each file
+	// reached through include directives (including files referenced more than once).
+	Files []string
+	// IncludePatterns contains the absolute include patterns encountered in the config.
+	// Patterns are resolved the same way the parser resolves them, relative to the root
+	// config directory, and may contain glob characters.
+	IncludePatterns []string
+}
+
+// ParseResult is the result of a single config parse together with the resolved include graph.
+type ParseResult struct {
+	ConfigContext *model.NginxConfigContext
+	Graph         *ConfigGraph
+}
+
+var (
+	_ ConfigParser          = (*NginxConfigParser)(nil)
+	_ ConfigParserWithGraph = (*NginxConfigParser)(nil)
+)
 
 type (
 	crossplaneTraverseCallback           = func(ctx context.Context, parent, current *crossplane.Directive) error
@@ -155,6 +187,17 @@ func getIPv4Address(iface net.Interface) string {
 }
 
 func (ncp *NginxConfigParser) Parse(ctx context.Context, instance *mpi.Instance) (*model.NginxConfigContext, error) {
+	result, err := ncp.ParseWithGraph(ctx, instance)
+	if err != nil || result == nil {
+		return nil, err
+	}
+
+	return result.ConfigContext, nil
+}
+
+func (ncp *NginxConfigParser) ParseWithGraph(
+	ctx context.Context, instance *mpi.Instance,
+) (*ParseResult, error) {
 	configPath, _ := filepath.Abs(instance.GetInstanceRuntime().GetConfigPath())
 
 	if !ncp.agentConfig.IsDirectoryAllowed(configPath) {
@@ -183,7 +226,73 @@ func (ncp *NginxConfigParser) Parse(ctx context.Context, instance *mpi.Instance)
 		return nil, err
 	}
 
-	return ncp.createNginxConfigContext(ctx, instance, payload, configPath)
+	nginxConfigContext, err := ncp.createNginxConfigContext(ctx, instance, payload, configPath)
+
+	return &ParseResult{
+		ConfigContext: nginxConfigContext,
+		Graph:         buildConfigGraph(payload, configPath),
+	}, err
+}
+
+// buildConfigGraph extracts the resolved include graph from a parsed crossplane payload. The
+// included file list is taken from the files the parser actually read. Include patterns are
+// resolved relative to the root config directory, mirroring the parser's own resolution, so that
+// glob matched directories can be tracked independently of the file containing the directive.
+func buildConfigGraph(payload *crossplane.Payload, rootConfigPath string) *ConfigGraph {
+	graph := &ConfigGraph{RootPath: rootConfigPath}
+
+	rootDir := filepath.Dir(rootConfigPath)
+	seenFiles := make(map[string]struct{})
+	seenPatterns := make(map[string]struct{})
+
+	for _, conf := range payload.Config {
+		if _, ok := seenFiles[conf.File]; !ok {
+			seenFiles[conf.File] = struct{}{}
+			graph.Files = append(graph.Files, conf.File)
+		}
+
+		for _, pattern := range includeDirectivePatterns(&conf, rootDir) {
+			if _, ok := seenPatterns[pattern]; !ok {
+				seenPatterns[pattern] = struct{}{}
+				graph.IncludePatterns = append(graph.IncludePatterns, pattern)
+			}
+		}
+	}
+
+	sort.Strings(graph.Files)
+	sort.Strings(graph.IncludePatterns)
+
+	return graph
+}
+
+// includeDirectivePatterns returns the absolute include patterns referenced from a parsed config
+// file. Relative patterns are resolved against the root config directory, which is how the parser
+// resolves them while reading files.
+func includeDirectivePatterns(conf *crossplane.Config, rootDir string) []string {
+	var patterns []string
+
+	var collect func(directives crossplane.Directives)
+	collect = func(directives crossplane.Directives) {
+		for _, directive := range directives {
+			if directive.Directive == "include" && len(directive.Args) > 0 {
+				patterns = append(patterns, resolveIncludePattern(directive.Args[0], rootDir))
+			}
+
+			collect(directive.Block)
+		}
+	}
+
+	collect(conf.Parsed)
+
+	return patterns
+}
+
+func resolveIncludePattern(pattern, rootDir string) string {
+	if !filepath.IsAbs(pattern) {
+		pattern = filepath.Join(rootDir, pattern)
+	}
+
+	return filepath.Clean(pattern)
 }
 
 func (ncp *NginxConfigParser) FindStubStatusAPI(
