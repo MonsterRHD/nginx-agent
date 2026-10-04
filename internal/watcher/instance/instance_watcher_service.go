@@ -52,6 +52,7 @@ type (
 		agentConfig                    *config.Config
 		instanceCache                  map[string]*mpi.Instance
 		nginxConfigCache               map[string]*model.NginxConfigContext
+		pendingInstances               map[string]*pendingGeneration
 		instancesChannel               chan<- ResourceUpdatesMessage
 		nginxConfigContextChannel      chan<- NginxConfigContextMessage
 		info                           host.InfoInterface
@@ -61,8 +62,20 @@ type (
 		resourceMutex                  sync.Mutex
 	}
 
-	InstanceUpdates struct {
-		UpdatedInstances []*mpi.Instance
+	// discovery is the process based candidate snapshot for a single monitoring cycle. Nothing in here is confirmed.
+	discovery struct {
+		nginx     map[string]*mpi.Instance
+		napUpdate bool
+	}
+
+	// pendingGeneration tracks a discovered process based candidate whose configuration has not been confirmed yet.
+	// The confirmed generation for the instance keeps being used until the pending candidate confirms or disappears.
+	pendingGeneration struct {
+		instanceID string
+		processID  int32
+		candidate  *mpi.Instance
+		attempts   int
+		err        error
 	}
 
 	ResourceUpdatesMessage struct {
@@ -92,6 +105,7 @@ func NewInstanceWatcherService(agentConfig *config.Config) *InstanceWatcherServi
 		cacheMutex:                     sync.Mutex{},
 		resourceMutex:                  sync.Mutex{},
 		nginxConfigCache:               make(map[string]*model.NginxConfigContext),
+		pendingInstances:               make(map[string]*pendingGeneration),
 		executer:                       &exec.Exec{},
 		info:                           host.NewInfo(),
 		resource:                       &mpi.Resource{},
@@ -198,8 +212,6 @@ func (iw *InstanceWatcherService) HandleNginxConfigContextUpdate(ctx context.Con
 
 	if updatesRequired {
 		iw.updateInstanceInResource(ctx, instance)
-		instanceUpdates := InstanceUpdates{}
-		instanceUpdates.UpdatedInstances = append(instanceUpdates.UpdatedInstances, instance)
 		select {
 		case iw.instancesChannel <- ResourceUpdatesMessage{
 			CorrelationID: correlationID,
@@ -211,55 +223,155 @@ func (iw *InstanceWatcherService) HandleNginxConfigContextUpdate(ctx context.Con
 	}
 }
 
+// checkForUpdates performs one discovery/confirmation cycle. Process discovery and configuration confirmation are
+// kept separate: a process based candidate only becomes the confirmed generation of an instance once its
+// configuration parses successfully. Candidates whose configuration cannot be parsed yet, for example while the
+// configuration files are being atomically replaced, remain pending; the last confirmed configuration and collection
+// keep being used, the pending error is logged and the still alive candidate is retried on every following cycle
+// until it confirms, is superseded by a newer candidate or disappears.
+//
+// On confirmation the instance resource and the configuration context are published from the same generation, so
+// downstream configuration context, file watcher and collector receivers switch to the same generation once and the
+// added, updated and removed events are neither duplicated nor lost.
 func (iw *InstanceWatcherService) checkForUpdates(
 	ctx context.Context,
 ) {
 	correlationID := logger.GenerateCorrelationID()
 	newCtx := context.WithValue(ctx, logger.CorrelationIDContextKey, correlationID)
 
-	instanceUpdates, err := iw.instanceUpdates(newCtx)
+	found, err := iw.discover(newCtx)
 	if err != nil {
 		slog.ErrorContext(newCtx, "Instance watcher updates", "error", err)
 	}
+	if found == nil {
+		return
+	}
 
-	instancesToParse := make([]*mpi.Instance, 0, len(instanceUpdates.UpdatedInstances))
-	instancesToParse = append(instancesToParse, instanceUpdates.UpdatedInstances...)
+	iw.cacheMutex.Lock()
 
-	for _, newInstance := range instancesToParse {
-		instanceType := newInstance.GetInstanceMeta().GetInstanceType()
-		slog.DebugContext(
-			newCtx,
-			"Parsing instance config",
-			"instance_id", newInstance.GetInstanceMeta().GetInstanceId(),
-			"instance_type", instanceType,
-		)
+	agentInstance := iw.agentInstance(newCtx)
 
-		if instanceType == mpi.InstanceMeta_INSTANCE_TYPE_NGINX ||
-			instanceType == mpi.InstanceMeta_INSTANCE_TYPE_NGINX_PLUS {
-			nginxConfigContext, parseErr := iw.nginxConfigParser.Parse(newCtx, newInstance)
-			if parseErr != nil {
-				slog.WarnContext(
-					newCtx,
-					"Unable to parse NGINX instance config",
-					"config_path", newInstance.GetInstanceRuntime().GetConfigPath(),
-					"instance_id", newInstance.GetInstanceMeta().GetInstanceId(),
-					"instance_type", instanceType,
-					"error", parseErr,
-				)
-			} else {
-				iw.cacheMutex.Lock()
-				iw.sendNginxConfigContextUpdate(newCtx, nginxConfigContext)
-				proto.UpdateNginxInstanceRuntime(newInstance, nginxConfigContext)
+	confirmed := make(map[string]*mpi.Instance, len(iw.instanceCache)+1)
+	for instanceID, instance := range iw.instanceCache {
+		confirmed[instanceID] = instance
+	}
 
-				iw.nginxConfigCache[nginxConfigContext.InstanceID] = nginxConfigContext
-				iw.instanceCache[newInstance.GetInstanceMeta().GetInstanceId()] = newInstance
-				iw.cacheMutex.Unlock()
-			}
+	pending := make(map[string]*pendingGeneration, len(iw.pendingInstances))
+	for instanceID, candidate := range iw.pendingInstances {
+		pending[instanceID] = candidate
+	}
+
+	changed := false
+
+	if oldAgent, ok := iw.instanceCache[agentInstance.GetInstanceMeta().GetInstanceId()]; !ok ||
+		!areInstancesEqual(oldAgent.GetInstanceRuntime(), agentInstance.GetInstanceRuntime()) {
+		changed = true
+	}
+	confirmed[agentInstance.GetInstanceMeta().GetInstanceId()] = agentInstance
+
+	// Drop pending generations that have been superseded by a different, still alive candidate or disappeared.
+	for instanceID, candidateGeneration := range pending {
+		latest, ok := found.nginx[instanceID]
+		if !ok || latest.GetInstanceRuntime().GetProcessId() != candidateGeneration.processID {
+			slog.DebugContext(newCtx,
+				"Removing unconfirmed NGINX generation, candidate is no longer the latest alive process",
+				"instance_id", instanceID, "candidate_process_id", candidateGeneration.processID)
+			delete(pending, instanceID)
 		}
 	}
 
-	if len(instanceUpdates.UpdatedInstances) > 0 {
-		iw.updateResourceInstanceList(ctx, instanceUpdates.UpdatedInstances)
+	// Remove confirmed generations whose instances are no longer present.
+	for instanceID := range confirmed {
+		if instanceID == agentInstance.GetInstanceMeta().GetInstanceId() {
+			continue
+		}
+		if _, ok := found.nginx[instanceID]; !ok {
+			slog.InfoContext(newCtx, "NGINX instance no longer exists", "instance_id", instanceID)
+			delete(confirmed, instanceID)
+			delete(iw.nginxConfigCache, instanceID)
+			changed = true
+		}
+	}
+
+	var contextUpdates []*model.NginxConfigContext
+
+	// Confirm candidates matching the current configuration, retry the ones that are still unconfirmed.
+	for instanceID, candidate := range found.nginx {
+		if current, ok := confirmed[instanceID]; ok &&
+			areInstancesEqual(current.GetInstanceRuntime(), candidate.GetInstanceRuntime()) {
+			continue
+		}
+
+		candidateGeneration := pending[instanceID]
+		if candidateGeneration == nil ||
+			candidateGeneration.processID != candidate.GetInstanceRuntime().GetProcessId() {
+			candidateGeneration = newPendingGeneration(candidate)
+			pending[instanceID] = candidateGeneration
+		}
+
+		nginxConfigContext, parseErr := iw.nginxConfigParser.Parse(newCtx, candidate)
+		candidateGeneration.attempt(parseErr)
+
+		if parseErr != nil || nginxConfigContext == nil {
+			slog.WarnContext(newCtx,
+				"NGINX configuration for discovered process could not be confirmed, "+
+					"continuing to use the last confirmed configuration and retrying",
+				"instance_id", instanceID,
+				"candidate_process_id", candidateGeneration.processID,
+				"attempts", candidateGeneration.attempts,
+				"error", parseErr,
+			)
+
+			continue
+		}
+
+		proto.UpdateNginxInstanceRuntime(candidate, nginxConfigContext)
+
+		if cached := iw.nginxConfigCache[instanceID]; cached == nil ||
+			!cached.Equal(nginxConfigContext) {
+			contextUpdates = append(contextUpdates, nginxConfigContext)
+		}
+		iw.nginxConfigCache[instanceID] = nginxConfigContext
+		confirmed[instanceID] = candidate
+		delete(pending, instanceID)
+		changed = true
+
+		slog.InfoContext(newCtx, "Confirmed NGINX instance generation",
+			"instance_id", instanceID,
+			"process_id", candidate.GetInstanceRuntime().GetProcessId(),
+		)
+	}
+
+	if found.napUpdate {
+		changed = true
+	}
+
+	instancesToPublish := make([]*mpi.Instance, 0, len(confirmed)+1)
+	for _, instance := range confirmed {
+		instancesToPublish = append(instancesToPublish, instance)
+	}
+	if napInstance := iw.nginxAppProtectInstanceWatcher.NginxAppProtectInstance(); napInstance != nil {
+		instancesToPublish = append(instancesToPublish, napInstance)
+	}
+
+	iw.instanceCache = confirmed
+	iw.pendingInstances = pending
+
+	iw.cacheMutex.Unlock()
+
+	for _, nginxConfigContext := range contextUpdates {
+		select {
+		case iw.nginxConfigContextChannel <- NginxConfigContextMessage{
+			CorrelationID:      correlationID,
+			NginxConfigContext: nginxConfigContext,
+		}:
+		case <-ctx.Done():
+			return
+		}
+	}
+
+	if changed {
+		iw.updateResourceInstanceList(ctx, instancesToPublish)
 
 		select {
 		case iw.instancesChannel <- ResourceUpdatesMessage{
@@ -338,15 +450,12 @@ func (iw *InstanceWatcherService) sendNginxConfigContextUpdate(
 	}
 }
 
-func (iw *InstanceWatcherService) instanceUpdates(ctx context.Context) (
-	instanceUpdates InstanceUpdates,
-	err error,
-) {
-	iw.cacheMutex.Lock()
-	defer iw.cacheMutex.Unlock()
+// discover gathers the current NGINX processes and turns them into unconfirmed instance candidates. It only performs
+// process discovery, it never updates the confirmed instance state.
+func (iw *InstanceWatcherService) discover(ctx context.Context) (*discovery, error) {
 	nginxProcesses, err := iw.processOperator.Processes(ctx)
 	if err != nil {
-		return instanceUpdates, err
+		return nil, err
 	}
 
 	if !slices.EqualFunc(iw.processCache, nginxProcesses, func(a, b *nginxprocess.Process) bool {
@@ -361,34 +470,27 @@ func (iw *InstanceWatcherService) instanceUpdates(ctx context.Context) (
 		}
 	}
 
-	// NGINX Agent is always the first instance in the list
-	instancesFound := make(map[string]*mpi.Instance)
-	agentInstance := iw.agentInstance(ctx)
-	instancesFound[agentInstance.GetInstanceMeta().GetInstanceId()] = agentInstance
-
 	nginxInstances := iw.nginxParser.Parse(ctx, nginxProcesses)
-	for _, instance := range nginxInstances {
-		instancesFound[instance.GetInstanceMeta().GetInstanceId()] = instance
+	napUpdate := iw.nginxAppProtectInstanceWatcher.checkForAppProtectUpdates(ctx)
+
+	return &discovery{
+		nginx:     nginxInstances,
+		napUpdate: napUpdate,
+	}, nil
+}
+
+func newPendingGeneration(candidate *mpi.Instance) *pendingGeneration {
+	return &pendingGeneration{
+		instanceID: candidate.GetInstanceMeta().GetInstanceId(),
+		processID:  candidate.GetInstanceRuntime().GetProcessId(),
+		candidate:  candidate,
 	}
+}
 
-	if iw.nginxAppProtectInstanceWatcher.checkForAppProtectUpdates(ctx) ||
-		areInstanceDifferent(iw.instanceCache, instancesFound) {
-		var updatedInstances []*mpi.Instance
-		for _, instance := range instancesFound {
-			updatedInstances = append(updatedInstances, instance)
-		}
-
-		if iw.nginxAppProtectInstanceWatcher.NginxAppProtectInstance() != nil {
-			slog.DebugContext(ctx, "Adding nginx app protect instance to updated instance list")
-			updatedInstances = append(updatedInstances, iw.nginxAppProtectInstanceWatcher.NginxAppProtectInstance())
-		}
-
-		instanceUpdates.UpdatedInstances = updatedInstances
-	}
-
-	iw.instanceCache = instancesFound
-
-	return instanceUpdates, nil
+// attempt records one configuration confirmation attempt and the error that prevented confirmation, if any.
+func (p *pendingGeneration) attempt(err error) {
+	p.attempts++
+	p.err = err
 }
 
 func (iw *InstanceWatcherService) agentInstance(ctx context.Context) *mpi.Instance {
@@ -437,44 +539,6 @@ func (iw *InstanceWatcherService) agentInstance(ctx context.Context) *mpi.Instan
 	}
 
 	return instance
-}
-
-func areInstanceDifferent(oldInstancesMap, instancesMap map[string]*mpi.Instance) bool {
-	updatedInstancesMap := make(map[string]*mpi.Instance)
-	updatedOldInstancesMap := make(map[string]*mpi.Instance)
-
-	for instanceID, instance := range instancesMap {
-		_, ok := oldInstancesMap[instanceID]
-		if !ok {
-			return true
-		}
-		updatedInstancesMap[instanceID] = instance
-	}
-
-	for instanceID, oldInstance := range oldInstancesMap {
-		_, ok := instancesMap[instanceID]
-		if !ok {
-			return true
-		}
-		updatedOldInstancesMap[instanceID] = oldInstance
-	}
-
-	return checkForProcessChanges(updatedInstancesMap, updatedOldInstancesMap)
-}
-
-func checkForProcessChanges(
-	updatedInstancesMap map[string]*mpi.Instance,
-	updatedOldInstancesMap map[string]*mpi.Instance,
-) (updated bool) {
-	updated = false
-	for instanceID, instance := range updatedInstancesMap {
-		oldInstance := updatedOldInstancesMap[instanceID]
-		if !areInstancesEqual(oldInstance.GetInstanceRuntime(), instance.GetInstanceRuntime()) {
-			return true
-		}
-	}
-
-	return updated
 }
 
 func areInstancesEqual(oldRuntime, currentRuntime *mpi.InstanceRuntime) (equal bool) {
